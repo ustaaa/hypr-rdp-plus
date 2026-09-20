@@ -54,9 +54,10 @@ class HelperTests(unittest.TestCase):
         self.configured()
         conf = self.app.read_config()
         self.assertTrue(conf["microphone"])
+        self.assertFalse(conf["resize_output"])
         self.assertEqual(conf["fps"], 60)
         self.assertEqual(conf["max_frames_in_flight"], 2)
-        for key, value in (("microphone", "false"), ("fps", True), ("fps", 14),
+        for key, value in (("resize_output", "true"), ("resize_output", 1), ("microphone", "false"), ("fps", True), ("fps", 14),
                            ("fps", 61), ("fps", 30.5), ("max_frames_in_flight", 0),
                            ("max_frames_in_flight", 4), ("max_frames_in_flight", "2")):
             with self.subTest(key=key, value=value), self.assertRaises(rd.Problem):
@@ -79,6 +80,22 @@ class HelperTests(unittest.TestCase):
                 self.assertEqual(args[args.index("--egfx-codec") + 1], "avc420")
                 exported = Path(self.app.export()["path"]).read_bytes().decode("utf-16")
                 self.assertIn(f"audiocapturemode:i:{int(microphone)}", exported)
+                self.assertEqual(self.app.credential(), PASSWORD)
+
+    def test_resize_output_opt_in_roundtrip(self):
+        self.configured()
+        default_args = self.app.backend_args(self.app.read_config(), "generation")
+        self.assertIn("--resize-output=false", default_args)
+        for enabled in (True, False):
+            with self.subTest(resize_output=enabled):
+                with patch.object(self.app, "stop"), patch.object(self.app, "ensure_certificate"), \
+                     patch.object(self.app, "install_unit"), patch.object(rd, "inventory", return_value=LIVE):
+                    self.app.configure({**GOOD, "resize_output": enabled})
+                conf = self.app.read_config()
+                self.assertEqual(conf["resize_output"], enabled)
+                args = self.app.backend_args(conf, "generation")
+                self.assertIn("--resize-output=" + str(enabled).lower(), args)
+                self.assertIn("--microphone=true", args)
                 self.assertEqual(self.app.credential(), PASSWORD)
 
     def test_complete_password_required(self):

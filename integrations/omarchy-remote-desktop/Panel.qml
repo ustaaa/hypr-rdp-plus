@@ -36,6 +36,7 @@ Ui.Panel {
         port.value = config.port || 3389
         audio.checked = config.audio === true
         microphone.checked = config.microphone !== false
+        resizeOutput.checked = config.resize_output === true
         fps.value = config.fps || 60
         queuedFrames.value = config.max_frames_in_flight || 2
         chosenOutput = config.output || ""
@@ -47,7 +48,7 @@ Ui.Panel {
         backend.configure({
             output: monitor.value || "", address: network.value || "",
             username: username.text, password: password.text, port: port.value,
-            audio: audio.checked, microphone: microphone.checked,
+            audio: audio.checked, microphone: microphone.checked, resize_output: resizeOutput.checked,
             fps: fps.value, max_frames_in_flight: queuedFrames.value
         }, enable)
         password.text = ""
@@ -313,6 +314,7 @@ Ui.Panel {
                                 Caption { text: "Port"; textFormat: Text.PlainText; color: Color.foreground }
                                 Ui.NumberField { id: port; from: 1024; to: 65535; value: 3389; onModified: function(value) { port.value = value }; Accessible.name: "RDP port" }
                             }
+                            Ui.Toggle { id: resizeOutput; label: "Adapt monitor to client resolution"; description: "Resize this shared desktop to the RDP client's resolution. Other viewers see the same change. Restore the previous monitor settings on disconnect."; Layout.fillWidth: true; onClicked: checked = !checked }
                             Ui.Toggle { id: microphone; label: "Remote microphone"; description: "Use the connecting device's microphone on Omarchy. Also enable microphone redirection in your RDP client."; Layout.fillWidth: true; onClicked: checked = !checked }
                             RowLayout {
                                 Caption { text: "Maximum FPS"; textFormat: Text.PlainText; color: Color.foreground }

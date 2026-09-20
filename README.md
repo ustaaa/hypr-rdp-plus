@@ -1,5 +1,7 @@
 # hypr-rdp
 
+Optional: [resize the existing desktop to the RDP client](RESIZE-OUTPUT.md).
+
 > **Community microphone build:** adds opt-in RDP microphone input and an optional Omarchy settings integration. See [microphone support and tested clients](MICROPHONE.md), [build instructions](BUILD-MICROPHONE.md), and [Omarchy integration setup](integrations/omarchy-remote-desktop/INSTALL-MICROPHONE.md). The upstream AUR/Nix/release commands below install upstream builds, which do not include this patch.
 
 Native RDP server for Hyprland.

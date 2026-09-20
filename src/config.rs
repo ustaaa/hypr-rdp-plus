@@ -159,6 +159,10 @@ struct Args {
     #[arg(long)]
     output: Option<String>,
 
+    /// Resize the selected existing output to the client size and restore on disconnect
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    resize_output: Option<bool>,
+
     /// Shell command to run when an authenticated session starts
     /// (without configured credentials: any established session)
     #[arg(long)]
@@ -211,6 +215,7 @@ struct ConfigFile {
     microphone: Option<bool>,
     h264_backend: Option<String>,
     output: Option<String>,
+    resize_output: Option<bool>,
     on_session_start: Option<String>,
     on_session_end: Option<String>,
     file_transfer_mode: Option<String>,
@@ -283,6 +288,7 @@ pub struct RuntimeConfig {
     pub h264_backend: H264BackendPolicy,
     pub resolution_fixed: bool,
     pub output: Option<String>,
+    pub resize_output: bool,
     pub on_session_start: Option<String>,
     pub on_session_end: Option<String>,
     pub file_transfer_mode: FileTransferMode,
@@ -404,8 +410,11 @@ impl RuntimeConfig {
             resolve_file_transfer_mode(args.file_transfer_mode, config.file_transfer_mode)?;
         let file_transfer_mode = requested_file_transfer_mode.for_build();
         if file_transfer_mode != requested_file_transfer_mode {
-            tracing::warn!(?requested_file_transfer_mode, ?file_transfer_mode,
-                "Client-to-server file transfer is not compiled in; disabling the unavailable direction");
+            tracing::warn!(
+                ?requested_file_transfer_mode,
+                ?file_transfer_mode,
+                "Client-to-server file transfer is not compiled in; disabling the unavailable direction"
+            );
         }
 
         let warnings = match &authentication {
@@ -458,6 +467,8 @@ impl RuntimeConfig {
         let audio_mode = resolve_audio_mode(args.audio_mode, config.audio_mode)?;
         let h264_backend = resolve_h264_backend_policy(args.h264_backend, config.h264_backend)?;
         let output = args.output.or(config.output);
+        let resize_output = args.resize_output.or(config.resize_output).unwrap_or(false);
+        validate_resize_output(resize_output, output.as_deref(), resolution_fixed)?;
         let on_session_start = args.on_session_start.or(config.on_session_start);
         let on_session_end = args.on_session_end.or(config.on_session_end);
         let file_transfer_max_chunk_bytes = args
@@ -503,6 +514,7 @@ impl RuntimeConfig {
             keyboard_layout_policy,
             audio_mode,
             microphone,
+            resize_output,
             h264_backend,
             resolution_fixed,
             output,
@@ -534,7 +546,9 @@ fn parse_file_transfer_mode(value: &str) -> anyhow::Result<FileTransferMode> {
         "to-server" => Ok(FileTransferMode::ToServer),
         "both" => Ok(FileTransferMode::Both),
         other => {
-            anyhow::bail!("unknown file transfer mode '{other}', expected 'off', 'to-client', 'to-server', or 'both'")
+            anyhow::bail!(
+                "unknown file transfer mode '{other}', expected 'off', 'to-client', 'to-server', or 'both'"
+            )
         }
     }
 }
@@ -742,8 +756,46 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
     Ok((w, h))
 }
 
+fn validate_resize_output(enabled: bool, output: Option<&str>, fixed: bool) -> anyhow::Result<()> {
+    if enabled && output.is_none_or(|name| name.trim().is_empty()) {
+        anyhow::bail!("--resize-output requires --output naming an existing monitor");
+    }
+    if enabled && fixed {
+        anyhow::bail!("--resize-output cannot be combined with a fixed --resolution");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resize_output_is_opt_in_and_rejects_ambiguous_configuration() {
+        use clap::Parser;
+        assert_eq!(
+            super::Args::try_parse_from(["hypr-rdp"])
+                .unwrap()
+                .resize_output,
+            None
+        );
+        assert_eq!(
+            super::Args::try_parse_from(["hypr-rdp", "--resize-output"])
+                .unwrap()
+                .resize_output,
+            Some(true)
+        );
+        assert_eq!(
+            super::Args::try_parse_from(["hypr-rdp", "--resize-output=false"])
+                .unwrap()
+                .resize_output,
+            Some(false)
+        );
+        assert!(super::validate_resize_output(true, None, false).is_err());
+        assert!(super::validate_resize_output(true, Some(""), false).is_err());
+        assert!(super::validate_resize_output(true, Some("Virtual-1"), true).is_err());
+        assert!(super::validate_resize_output(true, Some("Virtual-1"), false).is_ok());
+        assert!(super::validate_resize_output(false, None, true).is_ok());
+    }
+
     #[test]
     fn microphone_cli_is_opt_in_and_accepts_false() {
         use clap::Parser;

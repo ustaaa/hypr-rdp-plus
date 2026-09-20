@@ -32,7 +32,7 @@ MARKER = "# Managed by kokd.remote-desktop\n"
 MAX_IO = 65536
 ROOT = Path(__file__).resolve().parent.parent
 FLAGS = ("--password-file", "--output", "--cert", "--key", "--config",
-         "--on-session-start", "--on-session-end", "--audio-mode", "--egfx-codec", "--microphone", "--fps", "--max-frames-in-flight")
+         "--on-session-start", "--on-session-end", "--audio-mode", "--egfx-codec", "--microphone", "--fps", "--max-frames-in-flight", "--resize-output")
 
 
 class Problem(Exception):
@@ -192,7 +192,7 @@ def validate(values):
     port = values.get("port", 3389)
     if type(port) is not int or not 1024 <= port <= 65535:
         raise Problem("Port must be a number between 1024 and 65535.")
-    for key in ("autostart", "audio", "microphone"):
+    for key in ("autostart", "audio", "microphone", "resize_output"):
         if type(values.get(key, key == "microphone")) is not bool:
             raise Problem(f"Invalid {key} setting.")
     for key, default, lower, upper in (("fps", 60, 15, 60), ("max_frames_in_flight", 2, 1, 3)):
@@ -201,6 +201,7 @@ def validate(values):
             raise Problem(f"{key} must be a whole number between {lower} and {upper}.")
     return dict(address=str(ip), port=port, username=username, output=output,
                 autostart=values.get("autostart", False), audio=values.get("audio", False),
+                resize_output=values.get("resize_output", False),
                 microphone=values.get("microphone", True), fps=values.get("fps", 60),
                 max_frames_in_flight=values.get("max_frames_in_flight", 2))
 
@@ -532,6 +533,7 @@ WantedBy=graphical-session.target
                 "--key", str(self.data / "key.pem"), "--output", conf["output"], "--fps", str(conf["fps"]),
                 "--max-frames-in-flight", str(conf["max_frames_in_flight"]),
                 "--microphone=" + str(conf["microphone"]).lower(),
+                "--resize-output=" + str(conf["resize_output"]).lower(),
                 "--egfx-codec", "avc420", "--audio-mode", "mirror" if conf["audio"] else "off",
                 "--on-session-start", shlex.join(callback + ["start", generation]),
                 "--on-session-end", shlex.join(callback + ["end", generation])]

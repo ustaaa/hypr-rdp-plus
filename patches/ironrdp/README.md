@@ -19,7 +19,7 @@ the complete upstream source checkout, including its license files; this patch
 does not replace or remove those notices. See the [upstream repository](https://github.com/Devolutions/IronRDP).
 
 Patch SHA-256:
-`27e56a892e56f49adb57130777e07cc19086b1e1a4d323257ba879fb646a0fd5`
+`757583b10d09a0947c9ae4da200086b9efc5363870501da6c23fa130781edb2c`
 
 This is a development integration, not a claim that PR #1946 has been merged or
 that all RDP clients have passed microphone interoperability testing.
@@ -30,3 +30,8 @@ network flush. Oversized batches fail the connection instead of allocating
 without limit. Slow sends can still delay handlers that need to send a reply.
 Regression tests exercise input progress under a blocked socket, wire ordering,
 disconnect flushing, transport errors, and the staging limit.
+
+Existing-output resizing also requires session-safe DisplayControl delivery.
+Queued jobs carry a backend-liveness flag, invalidated when channels close;
+connection cleanup waits for active display work before notifying disconnect.
+This prevents a previous client's queued resize from modifying a new session.

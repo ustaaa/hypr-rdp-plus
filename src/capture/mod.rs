@@ -1,6 +1,7 @@
 mod damage;
 #[cfg(feature = "vaapi")]
 pub mod dmabuf;
+mod existing_output;
 mod frame;
 mod scale;
 mod wayland;
@@ -62,9 +63,50 @@ struct HyprDisplayInner {
     resize_gate: Arc<Mutex<()>>,
     closed: bool,
     output_size_unconfirmed: bool,
+    existing_output: Option<Arc<std::sync::Mutex<existing_output::ExistingOutput>>>,
+    pending_restore: Arc<AtomicBool>,
 }
 
 impl HyprDisplayInner {
+    fn restore_existing_output(&mut self) -> bool {
+        let Some(controller) = self.existing_output.clone() else {
+            return true;
+        };
+        let restored = match controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .restore()
+        {
+            Ok(Some((width, height))) => {
+                let _ = apply_presentation_state_with(
+                    self,
+                    width,
+                    height,
+                    SharedOutputLayout::update_from_output_with_presentation,
+                );
+                self.pending_initial_resize = None;
+                true
+            }
+            Ok(None) => true,
+            Err(error) => {
+                tracing::error!(%error, "Failed to restore existing output after session");
+                false
+            }
+        };
+        restored
+    }
+    fn finish_pending_restore(&mut self) {
+        if self.pending_restore.swap(false, Ordering::AcqRel) && self.existing_output.is_some() {
+            self.stop_flag.store(true, Ordering::Release);
+            drop(self.update_rx.take());
+            if let Some(handle) = self.capture_handle.take() {
+                let _ = handle.join();
+            }
+            if !self.restore_existing_output() {
+                self.pending_restore.store(true, Ordering::Release);
+            }
+        }
+    }
     /// Explicit shutdown: stop capture thread → join → remove headless output.
     fn shutdown(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
@@ -72,6 +114,7 @@ impl HyprDisplayInner {
             let _ = handle.join();
         }
         // Thread exited, Wayland connection closed. Safe to remove output.
+        self.restore_existing_output();
         drop(self.headless_guard.take());
     }
 }
@@ -88,9 +131,40 @@ impl Drop for HyprDisplayInner {
 #[derive(Clone)]
 pub struct HyprDisplayHandle {
     inner: Arc<Mutex<HyprDisplayInner>>,
+    pending_restore: Arc<AtomicBool>,
+    resize_gate: Arc<Mutex<()>>,
 }
 
 impl HyprDisplayHandle {
+    fn for_inner(inner: Arc<Mutex<HyprDisplayInner>>) -> Self {
+        let state = inner
+            .try_lock()
+            .expect("new display handle requires unlocked state");
+        let pending_restore = Arc::clone(&state.pending_restore);
+        let resize_gate = Arc::clone(&state.resize_gate);
+        drop(state);
+        Self {
+            inner,
+            pending_restore,
+            resize_gate,
+        }
+    }
+
+    /// Mark synchronously before spawning: next negotiation drains this pending
+    /// restore under the same gate even if its worker wins scheduling first.
+    pub fn restore_output_after_session(&self) {
+        self.pending_restore.store(true, Ordering::Release);
+        let lease = self.clone();
+        let restore = move || {
+            let _permit = lease.resize_gate.blocking_lock();
+            lease.inner.blocking_lock().finish_pending_restore();
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(restore);
+        } else {
+            std::thread::spawn(restore);
+        }
+    }
     pub async fn shutdown(&self) {
         let gate = {
             let mut inner = self.inner.lock().await;
@@ -105,6 +179,31 @@ impl HyprDisplayHandle {
             lease.blocking_lock().shutdown();
         })
         .await;
+    }
+}
+
+async fn finish_pending_restore_with_permit(
+    inner: Arc<Mutex<HyprDisplayInner>>,
+    permit: tokio::sync::OwnedMutexGuard<()>,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let state = inner.lock().await;
+    if !state.pending_restore.load(Ordering::Acquire) {
+        return permit;
+    }
+    let gate = Arc::clone(&state.resize_gate);
+    drop(state);
+    // The worker keeps the gate even if the awaiting connection is cancelled.
+    match tokio::task::spawn_blocking(move || {
+        inner.blocking_lock().finish_pending_restore();
+        permit
+    })
+    .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            tracing::error!(%error, "Output restore worker failed");
+            gate.lock_owned().await
+        }
     }
 }
 
@@ -195,12 +294,42 @@ fn reconcile_resize_decision(
     decision: Option<ResizeDecision>,
 ) -> Option<ResizeDecision> {
     decision.or_else(|| {
-        (inner.output.is_none() && inner.output_size_unconfirmed).then_some(ResizeDecision {
-            target: ResizeTarget::ManagedHeadlessOutput,
-            width: inner.resolution.0,
-            height: inner.resolution.1,
-        })
+        ((inner.output.is_none() || inner.existing_output.is_some())
+            && inner.output_size_unconfirmed)
+            .then_some(ResizeDecision {
+                target: ResizeTarget::ManagedHeadlessOutput,
+                width: inner.resolution.0,
+                height: inner.resolution.1,
+            })
     })
+}
+
+/// After a physical-mode rejection/rollback, use freshly queried source
+/// geometry for a presentation-only fallback. Never trust the pre-resize
+/// snapshot: the compositor may have partially applied a failed request.
+fn prepare_existing_initial_resize_with(
+    requested: (u32, u32),
+    resize: impl FnOnce() -> Result<PreparedOutputLayout>,
+    actual_source: impl FnOnce() -> Result<(u32, u32)>,
+    fallback: impl FnOnce((u32, u32)) -> Result<PreparedOutputLayout>,
+) -> Result<(PreparedOutputLayout, (u32, u32))> {
+    match resize() {
+        Ok(prepared) => Ok((prepared, requested)),
+        Err(error) => {
+            let source = actual_source()
+                .context("cannot safely fall back without actual output geometry")?;
+            let presentation = normalize_presentation_size(requested, source);
+            anyhow::ensure!(
+                presentation.0 > 0 && presentation.1 > 0,
+                "invalid fallback geometry"
+            );
+            let prepared = fallback(presentation)?;
+            tracing::warn!(%error, source_w = source.0, source_h = source.1,
+                presentation_w = presentation.0, presentation_h = presentation.1,
+                "Physical output resize rejected; using presentation-only fallback");
+            Ok((prepared, presentation))
+        }
+    }
 }
 
 fn startup_presentation_size(
@@ -364,6 +493,27 @@ fn apply_resize_decision_with(
     mut resize_headless: impl FnMut(&str, u32, u32, f64) -> Result<()>,
     mut refresh_layout: impl FnMut(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
 ) -> Option<DesktopSize> {
+    if let Some(existing) = inner.existing_output.clone() {
+        return match existing.lock().unwrap_or_else(|e| e.into_inner()).resize(
+            decision.width,
+            decision.height,
+            || {
+                apply_presentation_state_with(
+                    inner,
+                    decision.width,
+                    decision.height,
+                    &mut refresh_layout,
+                )
+                .context("failed to update input layout for resized output")
+            },
+        ) {
+            Ok(size) => Some(size),
+            Err(error) => {
+                tracing::warn!(%error, "Existing output resize failed; keeping previous mode");
+                None
+            }
+        };
+    }
     match decision.target {
         ResizeTarget::ManagedHeadlessOutput => {
             inner.output_size_unconfirmed = true;
@@ -413,6 +563,7 @@ impl HyprDisplay {
         h264_backend: H264BackendPolicy,
         resolution_fixed: bool,
         output: Option<String>,
+        resize_output: bool,
     ) -> Result<(Self, HyprDisplayHandle, (u16, u16))> {
         let (tx, rx) = mpsc::channel(128);
         let requested_resolution = resolution;
@@ -508,6 +659,17 @@ impl HyprDisplay {
             protocol_name
         );
 
+        let existing_output = if resize_output {
+            Some(Arc::new(std::sync::Mutex::new(
+                existing_output::ExistingOutput::new(
+                    output
+                        .clone()
+                        .context("resize-output requires an existing output")?,
+                ),
+            )))
+        } else {
+            None
+        };
         let inner = Arc::new(Mutex::new(HyprDisplayInner {
             width: presentation_resolution.0 as u16,
             height: presentation_resolution.1 as u16,
@@ -533,15 +695,15 @@ impl HyprDisplay {
             resize_gate: Arc::new(Mutex::new(())),
             closed: false,
             output_size_unconfirmed: false,
+            existing_output,
+            pending_restore: Arc::new(AtomicBool::new(false)),
         }));
 
         let dims = (
             presentation_resolution.0 as u16,
             presentation_resolution.1 as u16,
         );
-        let handle = HyprDisplayHandle {
-            inner: Arc::clone(&inner),
-        };
+        let handle = HyprDisplayHandle::for_inner(Arc::clone(&inner));
         Ok((Self { inner }, handle, dims))
     }
 
@@ -555,6 +717,7 @@ impl HyprDisplay {
         // the compositor without publishing a new presentation.
         let gate = Arc::clone(&self.inner.lock().await.resize_gate);
         let permit = gate.lock_owned().await;
+        let permit = finish_pending_restore_with_permit(Arc::clone(&self.inner), permit).await;
         let work = {
             let mut inner = self.inner.lock().await;
             let source = inner
@@ -578,14 +741,14 @@ impl HyprDisplay {
                 );
             }
             let decision = initial_size_resize_decision(
-                inner.output.is_some(),
+                inner.output.is_some() && inner.existing_output.is_none(),
                 inner.resolution_fixed,
                 inner.resolution,
                 requested,
                 source,
             );
             let decision = reconcile_resize_decision(&inner, decision);
-            if inner.closed || decision.is_none() {
+            if inner.closed || inner.pending_restore.load(Ordering::Acquire) || decision.is_none() {
                 tracing::debug!(
                     client_w = client_size.width,
                     client_h = client_size.height,
@@ -608,30 +771,56 @@ impl HyprDisplay {
             if decision.target == ResizeTarget::ManagedHeadlessOutput {
                 inner.output_size_unconfirmed = true;
             }
-            (decision, inner.output_name.clone(), inner.headless_scale)
+            (
+                decision,
+                inner.output_name.clone(),
+                inner.headless_scale,
+                inner.existing_output.clone(),
+            )
         };
         let lease = Arc::clone(&self.inner);
-        let (decision, name, scale) = work;
+        let (decision, name, scale, existing) = work;
         let result = tokio::task::spawn_blocking(move || {
             // The lease and permit survive cancellation of the awaiting request.
             if lease.blocking_lock().closed {
                 anyhow::bail!("display is closed");
             }
-            if decision.target == ResizeTarget::ManagedHeadlessOutput {
-                resize_headless(name.clone(), decision.width, decision.height, scale)?;
-            }
-            let prepared = prepare_layout(&name, (decision.width, decision.height))?;
-            Ok::<_, anyhow::Error>((prepared, permit, lease))
+            let requested = (decision.width, decision.height);
+            let (prepared, presentation) = if let Some(existing) = existing {
+                prepare_existing_initial_resize_with(
+                    requested,
+                    || {
+                        existing.lock().unwrap_or_else(|e| e.into_inner()).resize(
+                            decision.width,
+                            decision.height,
+                            || prepare_layout(&name, requested),
+                        )
+                    },
+                    || wayland::output_info(&name).map(|info| (info.width, info.height)),
+                    |presentation| {
+                        SharedOutputLayout::prepare_from_output_with_presentation(
+                            &name,
+                            presentation,
+                        )
+                    },
+                )?
+            } else {
+                if decision.target == ResizeTarget::ManagedHeadlessOutput {
+                    resize_headless(name.clone(), decision.width, decision.height, scale)?;
+                }
+                (prepare_layout(&name, requested)?, requested)
+            };
+            Ok::<_, anyhow::Error>((prepared, presentation, permit, lease))
         })
         .await;
         let mut inner = self.inner.lock().await;
         match result {
-            Ok(Ok((prepared, _permit, _lease))) if !inner.closed => {
+            Ok(Ok((prepared, presentation, _permit, _lease))) if !inner.closed => {
                 let layout = Arc::clone(&inner.output_layout);
                 let size = apply_presentation_state_with(
                     &mut inner,
-                    decision.width,
-                    decision.height,
+                    presentation.0,
+                    presentation.1,
                     |_, _, _| {
                         layout.apply_prepared(prepared);
                         Ok(())
@@ -681,6 +870,14 @@ impl HyprDisplay {
         let gate = Arc::clone(&self.inner.blocking_lock().resize_gate);
         let _permit = gate.blocking_lock();
         let mut inner = self.inner.blocking_lock();
+        inner.finish_pending_restore();
+        if inner.pending_restore.load(Ordering::Acquire) {
+            return;
+        }
+        if inner.existing_output.is_some() && physical_display_control_size(&layout).is_none() {
+            tracing::warn!("Ignoring unsupported existing-output monitor layout");
+            return;
+        }
         if inner.closed {
             return;
         }
@@ -690,7 +887,7 @@ impl HyprDisplay {
             .map(|snapshot| (snapshot.output_w, snapshot.output_h));
         let decision = display_control_resize_decision(
             &layout,
-            inner.output.is_some(),
+            inner.output.is_some() && inner.existing_output.is_none(),
             inner.resolution_fixed,
             inner.resolution,
             source_size,
@@ -800,12 +997,13 @@ impl RdpServerDisplay for HyprDisplay {
         // A client may skip initial-size negotiation altogether. Capture must
         // still wait for a canceled previous session's external mutation.
         let gate = Arc::clone(&self.inner.lock().await.resize_gate);
-        let _permit = gate.lock_owned().await;
+        let permit = gate.lock_owned().await;
+        let _permit = finish_pending_restore_with_permit(Arc::clone(&self.inner), permit).await;
         // Extract stop_flag and handle before joining, to avoid holding
         // the Mutex during a blocking join() call.
         let (stop_flag, handle) = {
             let mut inner = self.inner.lock().await;
-            if inner.closed {
+            if inner.closed || inner.pending_restore.load(Ordering::Acquire) {
                 return Err(ServerError::reason(
                     "display closed",
                     "capture restart rejected",
@@ -895,6 +1093,69 @@ impl RdpServerDisplayUpdates for HyprDisplayUpdates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_existing_mode_failure_falls_back_using_actual_source_geometry() {
+        let output = SharedOutputLayout::default();
+        let (prepared, presentation) = prepare_existing_initial_resize_with(
+            (1920, 1080),
+            || anyhow::bail!("mode rejected; rollback attempted"),
+            || Ok((1280, 720)), // Actual mode can differ after a failed rollback.
+            |size| {
+                SharedOutputLayout::prepare_snapshot_for_test(
+                    "Virtual-1",
+                    1280,
+                    720,
+                    1280,
+                    720,
+                    0,
+                    0,
+                    size,
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(presentation, (1280, 720));
+        output.apply_prepared(prepared);
+        let snapshot = output.snapshot().unwrap();
+        assert_eq!((snapshot.output_w, snapshot.output_h), (1280, 720));
+        let mapped = snapshot.presentation_geometry.presentation();
+        assert_eq!((mapped.width, mapped.height), presentation);
+    }
+
+    #[test]
+    fn initial_existing_mode_failure_does_not_guess_when_actual_query_fails() {
+        let result = prepare_existing_initial_resize_with(
+            (1920, 1080),
+            || anyhow::bail!("mode rejected"),
+            || anyhow::bail!("output unavailable"),
+            |_| panic!("must not prepare an unverified fallback"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn initial_existing_mode_success_does_not_run_fallback() {
+        let (_, presentation) = prepare_existing_initial_resize_with(
+            (1920, 1080),
+            || {
+                SharedOutputLayout::prepare_snapshot_for_test(
+                    "Virtual-1",
+                    1920,
+                    1080,
+                    1920,
+                    1080,
+                    0,
+                    0,
+                    (1920, 1080),
+                )
+            },
+            || panic!("successful apply needs no fallback source query"),
+            |_| panic!("successful apply needs no fallback"),
+        )
+        .unwrap();
+        assert_eq!(presentation, (1920, 1080));
+    }
 
     #[test]
     fn capture_start_error_carries_the_whole_anyhow_chain() {
@@ -1053,6 +1314,8 @@ mod output_downscaling {
             resize_gate: Arc::new(Mutex::new(())),
             closed: false,
             output_size_unconfirmed: false,
+            existing_output: None,
+            pending_restore: Arc::new(AtomicBool::new(false)),
         };
 
         (
@@ -1632,6 +1895,8 @@ mod managed_headless_resize {
             resize_gate: Arc::new(Mutex::new(())),
             closed: false,
             output_size_unconfirmed: false,
+            existing_output: None,
+            pending_restore: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2031,9 +2296,7 @@ mod managed_headless_resize {
     async fn initial_resize_shutdown_waits_without_locking_out_runtime() {
         let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
         let inner = Arc::clone(&display.inner);
-        let handle = HyprDisplayHandle {
-            inner: Arc::clone(&inner),
-        };
+        let handle = HyprDisplayHandle::for_inner(Arc::clone(&inner));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let task = tokio::spawn(async move {
@@ -2205,7 +2468,7 @@ mod managed_headless_resize {
         let shutdown = tokio::spawn({
             let inner = Arc::clone(&inner);
             async move {
-                HyprDisplayHandle { inner }.shutdown().await;
+                HyprDisplayHandle::for_inner(inner).shutdown().await;
             }
         });
         tokio::time::timeout(Duration::from_secs(1), async {

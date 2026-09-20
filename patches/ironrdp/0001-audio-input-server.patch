@@ -591,7 +591,7 @@ index 0000000..9bd7ed4
 +    fn build_backend(&self) -> Box<dyn RdpeaiServerBackend>;
 +}
 diff --git c/crates/ironrdp-server/src/server.rs w/crates/ironrdp-server/src/server.rs
-index 0695f54..9672089 100644
+index 0695f54..8329f7a 100644
 --- c/crates/ironrdp-server/src/server.rs
 +++ w/crates/ironrdp-server/src/server.rs
 @@ -35,11 +35,13 @@ use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, Se
@@ -616,7 +616,50 @@ index 0695f54..9672089 100644
  use crate::rdpei::RdpeiServerFactory;
  #[cfg(feature = "usb")]
  use crate::urbdrc::{
-@@ -648,6 +651,7 @@ pub struct RdpServer {
+@@ -530,18 +533,39 @@ impl dvc::DvcServerProcessor for AInputHandler {}
+ 
+ struct DisplayControlBackend {
+     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
++    alive: Arc<AtomicBool>,
+ }
+ 
+ impl DisplayControlBackend {
+     fn new(display: Arc<Mutex<Box<dyn RdpServerDisplay>>>) -> Self {
+-        Self { display }
++        Self {
++            display,
++            alive: Arc::new(AtomicBool::new(true)),
++        }
++    }
++
++    fn queue_layout(&self, layout: DisplayControlMonitorLayout) -> task::JoinHandle<()> {
++        let display = Arc::clone(&self.display);
++        let alive = Arc::clone(&self.alive);
++        task::spawn_blocking(move || {
++            let mut display = display.blocking_lock();
++            // Check under the display lock: cleanup waits on this same lock.
++            if alive.load(Ordering::Acquire) {
++                display.request_layout(layout);
++            }
++        })
++    }
++}
++
++impl Drop for DisplayControlBackend {
++    fn drop(&mut self) {
++        self.alive.store(false, Ordering::Release);
+     }
+ }
+ 
+ impl DisplayControlHandler for DisplayControlBackend {
+     fn monitor_layout(&self, layout: DisplayControlMonitorLayout) {
+-        let display = Arc::clone(&self.display);
+-        task::spawn_blocking(move || display.blocking_lock().request_layout(layout));
++        self.queue_layout(layout);
+     }
+ }
+ 
+@@ -648,6 +672,7 @@ pub struct RdpServer {
      cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
      rdpei_factory: Option<Box<dyn RdpeiServerFactory>>,
      rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
@@ -624,7 +667,7 @@ index 0695f54..9672089 100644
      echo_handle: EchoServerHandle,
      #[cfg(feature = "egfx")]
      gfx_factory: Option<Box<dyn GfxServerFactory>>,
-@@ -816,6 +820,7 @@ pub enum ServerEvent {
+@@ -816,6 +841,7 @@ pub enum ServerEvent {
      Clipboard(ClipboardMessage),
      Rdpsnd(RdpsndServerMessage),
      Rdpdr(RdpdrServerMessage),
@@ -632,7 +675,7 @@ index 0695f54..9672089 100644
      Echo(EchoServerMessage),
      SetCredentials(Credentials),
      /// Replace or clear the Server Auto-Reconnect Cookie.
-@@ -847,6 +852,7 @@ impl fmt::Debug for ServerEvent {
+@@ -847,6 +873,7 @@ impl fmt::Debug for ServerEvent {
              Self::Clipboard(..) => f.write_str("Clipboard(..)"),
              Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
              Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
@@ -640,7 +683,7 @@ index 0695f54..9672089 100644
              Self::Echo(..) => f.write_str("Echo(..)"),
              Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
              Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
-@@ -1325,6 +1331,11 @@ impl RdpServer {
+@@ -1325,6 +1352,11 @@ impl RdpServer {
          clippy::too_many_arguments,
          reason = "called via the builder; positional parameters are an internal detail"
      )]
@@ -652,7 +695,7 @@ index 0695f54..9672089 100644
      pub(crate) fn new(
          opts: RdpServerOptions,
          handler: Box<dyn RdpServerInputHandler>,
-@@ -1334,6 +1345,7 @@ impl RdpServer {
+@@ -1334,6 +1366,7 @@ impl RdpServer {
          mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
          mut rdpei_factory: Option<Box<dyn RdpeiServerFactory>>,
          mut rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
@@ -660,7 +703,7 @@ index 0695f54..9672089 100644
          connection_handler: Option<Box<dyn ConnectionHandler>>,
          #[cfg(feature = "egfx")] mut gfx_factory: Option<Box<dyn GfxServerFactory>>,
          display_suppressed: Option<Arc<AtomicBool>>,
-@@ -1355,6 +1367,9 @@ impl RdpServer {
+@@ -1355,6 +1388,9 @@ impl RdpServer {
          if let Some(rdpdr) = rdpdr_factory.as_mut() {
              rdpdr.set_sender(ev_sender.clone());
          }
@@ -670,7 +713,7 @@ index 0695f54..9672089 100644
          #[cfg(feature = "egfx")]
          if let Some(gfx) = gfx_factory.as_mut() {
              gfx.set_sender(ev_sender.clone());
-@@ -1370,6 +1385,7 @@ impl RdpServer {
+@@ -1370,6 +1406,7 @@ impl RdpServer {
              cliprdr_factory,
              rdpei_factory,
              rdpdr_factory,
@@ -678,7 +721,7 @@ index 0695f54..9672089 100644
              echo_handle: EchoServerHandle::new(ev_sender.clone()),
              #[cfg(feature = "egfx")]
              gfx_factory,
-@@ -1831,6 +1847,13 @@ impl RdpServer {
+@@ -1831,6 +1868,13 @@ impl RdpServer {
              dvc
          };
  
@@ -692,7 +735,27 @@ index 0695f54..9672089 100644
          #[cfg(feature = "egfx")]
          let dvc = {
              let mut dvc = dvc;
-@@ -2818,6 +2841,62 @@ impl RdpServer {
+@@ -2056,6 +2100,9 @@ impl RdpServer {
+         // connections through this method with the previous session's backends
+         // still live until the next client attached new ones.
+         self.static_channels = StaticChannelSet::new();
++        // Dropping channels invalidates queued layout work. Await any worker
++        // that already passed its liveness check before session-end restoration.
++        drop(self.display.lock().await);
+ 
+         result
+     }
+@@ -2507,6 +2554,9 @@ impl RdpServer {
+             // capture, held open until the next client) for every preemption
+             // takeover.
+             self.static_channels = StaticChannelSet::new();
++            // Dropping channels invalidates queued layout work. Await any worker
++            // that already passed its liveness check before session-end restoration.
++            drop(self.display.lock().await);
+ 
+             if let Some(ref mut handler) = self.connection_handler {
+                 let action = handler.on_disconnected(peer, duration, result.as_ref().err());
+@@ -2818,6 +2868,62 @@ impl RdpServer {
                          .await
                          .map_err(|e| ServerError::io("write_all", e))?;
                  }
@@ -755,7 +818,7 @@ index 0695f54..9672089 100644
                  ServerEvent::Clipboard(c) => {
                      let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
                          warn!("No clipboard channel, dropping event");
-@@ -3118,6 +3197,50 @@ impl RdpServer {
+@@ -3118,6 +3224,50 @@ impl RdpServer {
          Ok(RunState::Continue)
      }
  
@@ -806,7 +869,7 @@ index 0695f54..9672089 100644
      #[expect(
          clippy::too_many_arguments,
          reason = "private per-connection entry point; the parameters are the connection's negotiated identifiers"
-@@ -3145,7 +3268,7 @@ impl RdpServer {
+@@ -3145,7 +3295,7 @@ impl RdpServer {
          let mut display_updates = self.display.lock().await.updates().await?;
          let mut writer = SharedWriter::new(writer);
          let mut display_writer = writer.clone();
@@ -815,7 +878,7 @@ index 0695f54..9672089 100644
          let mut auto_reconnect_writer = writer.clone();
          let mut heartbeat_writer = writer.clone();
          let write_counter = writer.write_counter();
-@@ -3250,41 +3373,29 @@ impl RdpServer {
+@@ -3250,41 +3400,29 @@ impl RdpServer {
                      debug!("No sever events.. stopping");
                      break Ok(RunState::Disconnect);
                  }
@@ -872,7 +935,7 @@ index 0695f54..9672089 100644
                  }
  
                  match result {
-@@ -4049,6 +4160,32 @@ async fn send_access_denied(
+@@ -4049,6 +4187,32 @@ async fn send_access_denied(
      Ok(())
  }
  
@@ -905,7 +968,88 @@ index 0695f54..9672089 100644
  struct SharedWriter<'w, W: FramedWrite> {
      writer: Rc<Mutex<&'w mut W>>,
      /// Count of successful `write_all` calls across all clones. The heartbeat
-@@ -4782,3 +4919,234 @@ mod tests {
+@@ -4733,6 +4897,80 @@ mod tests {
+ 
+     use super::*;
+ 
++    struct LayoutDisplay {
++        count: Arc<AtomicU32>,
++        started: Option<oneshot::Sender<()>>,
++        release: Option<std::sync::mpsc::Receiver<()>>,
++    }
++
++    #[async_trait::async_trait]
++    impl RdpServerDisplay for LayoutDisplay {
++        async fn size(&mut self) -> DesktopSize {
++            DesktopSize {
++                width: 800,
++                height: 600,
++            }
++        }
++        async fn updates(&mut self) -> ServerResult<Box<dyn crate::RdpServerDisplayUpdates>> {
++            unreachable!("layout test does not capture")
++        }
++        fn request_layout(&mut self, _: DisplayControlMonitorLayout) {
++            if let Some(started) = self.started.take() {
++                let _ = started.send(());
++            }
++            if let Some(release) = self.release.take() {
++                release.recv().unwrap();
++            }
++            self.count.fetch_add(1, Ordering::SeqCst);
++        }
++    }
++
++    #[tokio::test]
++    async fn disconnected_layout_worker_cannot_resize_replacement_session() {
++        let count = Arc::new(AtomicU32::new(0));
++        let display: Arc<Mutex<Box<dyn RdpServerDisplay>>> = Arc::new(Mutex::new(Box::new(LayoutDisplay {
++            count: Arc::clone(&count),
++            started: None,
++            release: None,
++        })));
++        let guard = display.lock().await;
++        let old = DisplayControlBackend::new(Arc::clone(&display));
++        let job =
++            old.queue_layout(DisplayControlMonitorLayout::new_single_primary_monitor(800, 600, None, None).unwrap());
++        drop(old);
++        let replacement = DisplayControlBackend::new(Arc::clone(&display));
++        drop(guard);
++        job.await.unwrap();
++        assert_eq!(count.load(Ordering::SeqCst), 0);
++        replacement
++            .queue_layout(DisplayControlMonitorLayout::new_single_primary_monitor(1024, 768, None, None).unwrap())
++            .await
++            .unwrap();
++        assert_eq!(count.load(Ordering::SeqCst), 1);
++    }
++
++    #[tokio::test]
++    async fn disconnect_display_barrier_waits_for_in_flight_layout() {
++        let count = Arc::new(AtomicU32::new(0));
++        let (started_tx, started_rx) = oneshot::channel();
++        let (release_tx, release_rx) = std::sync::mpsc::channel();
++        let display: Arc<Mutex<Box<dyn RdpServerDisplay>>> = Arc::new(Mutex::new(Box::new(LayoutDisplay {
++            count: Arc::clone(&count),
++            started: Some(started_tx),
++            release: Some(release_rx),
++        })));
++        let backend = DisplayControlBackend::new(Arc::clone(&display));
++        let job = backend
++            .queue_layout(DisplayControlMonitorLayout::new_single_primary_monitor(800, 600, None, None).unwrap());
++        started_rx.await.unwrap();
++        drop(backend);
++        assert!(display.try_lock().is_err());
++        release_tx.send(()).unwrap();
++        let _barrier = display.lock().await;
++        assert_eq!(count.load(Ordering::SeqCst), 1);
++        job.await.unwrap();
++    }
++
+     /// A channel backend that owns a resource, released on drop the way
+     /// `RdpsndServer` stops its handler.
+     #[derive(Debug)]
+@@ -4782,3 +5020,234 @@ mod tests {
          );
      }
  }

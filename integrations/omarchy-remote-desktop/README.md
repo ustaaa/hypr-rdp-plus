@@ -19,6 +19,13 @@ A lower frame queue reduces buffering but can limit smoothness on higher-latency
 networks. The FPS setting is a ceiling. AVC420 and automatic encoder selection
 are retained; the plugin does not force unsupported GPU codecs.
 
+**Adapt monitor to client resolution** is off by default, including when migrating
+existing settings. Enable it to resize the selected existing monitor to the RDP
+client's resolution. This changes the same shared desktop seen locally and by
+other viewers; the previous monitor settings are restored on disconnect. The
+plugin persists `resize_output` and passes an explicit `--resize-output=true` or
+`--resize-output=false` to a supporting custom backend.
+
 Enable microphone redirection in the RDP client as well, then select
 **Hypr-RDP Remote Microphone** in the Omarchy application. Exported `.rdp` files
 include `audiocapturemode` matching the microphone toggle. **Share audio** is

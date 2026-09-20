@@ -247,6 +247,31 @@ pub fn keyword_monitor(rule: &str) -> Result<()> {
     }
 }
 
+/// Apply a complete existing-output geometry, preserving transform explicitly.
+#[allow(clippy::too_many_arguments)]
+pub fn set_monitor_geometry(
+    name: &str,
+    width: u32,
+    height: u32,
+    refresh: f64,
+    x: i64,
+    y: i64,
+    scale: f64,
+    transform: u64,
+) -> Result<()> {
+    anyhow::ensure!(!name.contains([',', '\n', '\r']), "invalid output name");
+    let mode = format!("{width}x{height}@{refresh:.5}");
+    let position = format!("{x}x{y}");
+    match send_action(&format!("keyword monitor {name},{mode},{position},{scale},transform,{transform}")) {
+        Ok(()) => Ok(()),
+        Err(error) if is_non_legacy_parser_error(&error) => {
+            send_action(&format!("eval hl.monitor({{ output = {}, mode = {}, position = {}, scale = {scale}, transform = {transform} }})",
+                lua_string(name)?, lua_string(&mode)?, lua_string(&position)?))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn is_non_legacy_parser_error(error: &anyhow::Error) -> bool {
     error
         .chain()

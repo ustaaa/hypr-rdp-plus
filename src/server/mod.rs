@@ -53,6 +53,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         keyboard_layout_policy,
         audio_mode,
         microphone,
+        resize_output,
         h264_backend,
         resolution_fixed,
         output,
@@ -82,6 +83,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         h264_backend,
         resolution_fixed,
         output,
+        resize_output,
     )
     .await
     .context("failed to initialize display capture")?;
@@ -123,12 +125,16 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let mut server = secured_builder
         .with_input_handler(input_handler)
         .with_display_handler(display)
+        .with_honor_client_desktop_size(resize_output.then_some(ironrdp_server::DesktopSize {
+            width: 3840,
+            height: 2160,
+        }))
         .with_credential_validator(authentication.validator)
         .with_preempt_existing_session(security_mode.allows_authenticated_replacement())
-        .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
-            input_session_sink,
-            session_hooks,
-        ))))
+        .with_connection_handler(Some(Box::new(
+            ClientConnectionHandler::new(input_session_sink, session_hooks)
+                .with_display_handle(display_handle.clone()),
+        )))
         .with_gfx_factory(Some(Box::new(gfx_factory)))
         .with_cliprdr_factory(Some(Box::new(cliprdr_factory)))
         .with_rdpeai_factory(if microphone {
@@ -172,6 +178,7 @@ fn server_run_error(error: ServerError) -> anyhow::Error {
 struct ClientConnectionHandler {
     input_session_sink: Box<dyn RdpInputSessionSink>,
     session_hooks: Option<SessionHooks>,
+    display_handle: Option<HyprDisplayHandle>,
 }
 
 impl ClientConnectionHandler {
@@ -182,7 +189,13 @@ impl ClientConnectionHandler {
         Self {
             input_session_sink,
             session_hooks,
+            display_handle: None,
         }
+    }
+
+    fn with_display_handle(mut self, display: HyprDisplayHandle) -> Self {
+        self.display_handle = Some(display);
+        self
     }
 }
 
@@ -205,6 +218,9 @@ impl ConnectionHandler for ClientConnectionHandler {
         _error: Option<&ServerError>,
     ) -> PostConnectionAction {
         self.input_session_sink.session_ended();
+        if let Some(display) = &self.display_handle {
+            display.restore_output_after_session();
+        }
         if let Some(hooks) = &mut self.session_hooks {
             hooks.session_ended();
         }
