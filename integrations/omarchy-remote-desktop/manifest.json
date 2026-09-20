@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "kokd.remote-desktop",
+  "name": "Remote Desktop",
+  "version": "0.1.0",
+  "author": "Kostadin Kadiev",
+  "license": "MIT",
+  "description": "Share your existing Omarchy desktop over RDP with simple setup, private-network binding and native shell controls.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Remote Desktop",
+    "description": "Share your desktop through RDP",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

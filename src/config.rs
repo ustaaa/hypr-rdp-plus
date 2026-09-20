@@ -147,6 +147,9 @@ struct Args {
     /// Audio output policy: "redirect" (default), "mirror", or "off"
     #[arg(long)]
     audio_mode: Option<String>,
+    /// Accept remote microphone audio (default: false)
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    microphone: Option<bool>,
 
     /// H.264 encoder backend: "auto" (default), "software", or "vaapi"
     #[arg(long)]
@@ -205,6 +208,7 @@ struct ConfigFile {
     egfx_codec: Option<String>,
     keyboard_layout_policy: Option<String>,
     audio_mode: Option<String>,
+    microphone: Option<bool>,
     h264_backend: Option<String>,
     output: Option<String>,
     on_session_start: Option<String>,
@@ -275,6 +279,7 @@ pub struct RuntimeConfig {
     pub egfx_codec: EgfxCodecPolicy,
     pub keyboard_layout_policy: KeyboardLayoutPolicy,
     pub audio_mode: AudioMode,
+    pub microphone: bool,
     pub h264_backend: H264BackendPolicy,
     pub resolution_fixed: bool,
     pub output: Option<String>,
@@ -449,6 +454,7 @@ impl RuntimeConfig {
             args.keyboard_layout_policy,
             config.keyboard_layout_policy,
         )?;
+        let microphone = args.microphone.or(config.microphone).unwrap_or(false);
         let audio_mode = resolve_audio_mode(args.audio_mode, config.audio_mode)?;
         let h264_backend = resolve_h264_backend_policy(args.h264_backend, config.h264_backend)?;
         let output = args.output.or(config.output);
@@ -496,6 +502,7 @@ impl RuntimeConfig {
             egfx_codec,
             keyboard_layout_policy,
             audio_mode,
+            microphone,
             h264_backend,
             resolution_fixed,
             output,
@@ -737,6 +744,29 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn microphone_cli_is_opt_in_and_accepts_false() {
+        use clap::Parser;
+        assert_eq!(
+            super::Args::try_parse_from(["hypr-rdp"])
+                .unwrap()
+                .microphone,
+            None
+        );
+        assert_eq!(
+            super::Args::try_parse_from(["hypr-rdp", "--microphone"])
+                .unwrap()
+                .microphone,
+            Some(true)
+        );
+        assert_eq!(
+            super::Args::try_parse_from(["hypr-rdp", "--microphone=false"])
+                .unwrap()
+                .microphone,
+            Some(false)
+        );
+    }
+
     use super::*;
     use proptest::prelude::*;
     use std::fs;

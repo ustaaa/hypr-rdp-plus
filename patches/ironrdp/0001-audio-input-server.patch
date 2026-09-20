@@ -1,0 +1,1230 @@
+diff --git c/Cargo.lock w/Cargo.lock
+index 583987e..b3de265 100644
+--- c/Cargo.lock
++++ w/Cargo.lock
+@@ -3312,6 +3312,7 @@ dependencies = [
+  "ironrdp-nscodec",
+  "ironrdp-pdu",
+  "ironrdp-rdpdr",
++ "ironrdp-rdpeai",
+  "ironrdp-rdpei",
+  "ironrdp-rdpeusb",
+  "ironrdp-rdpsnd",
+diff --git c/crates/ironrdp-rdpeai/src/lib.rs w/crates/ironrdp-rdpeai/src/lib.rs
+index 6591615..2a51aac 100644
+--- c/crates/ironrdp-rdpeai/src/lib.rs
++++ w/crates/ironrdp-rdpeai/src/lib.rs
+@@ -6,5 +6,6 @@ pub const CHANNEL_NAME: &str = "AUDIO_INPUT";
+ 
+ pub mod client;
+ pub mod pdu;
++pub mod server;
+ 
+ pub use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
+diff --git c/crates/ironrdp-rdpeai/src/server.rs w/crates/ironrdp-rdpeai/src/server.rs
+new file mode 100644
+index 0000000..34b0497
+--- /dev/null
++++ w/crates/ironrdp-rdpeai/src/server.rs
+@@ -0,0 +1,457 @@
++//! AUDIO_INPUT dynamic virtual channel server (MS-RDPEAI).
++
++use ironrdp_core::{decode, impl_as_any};
++use ironrdp_dvc::{DvcMessage, DvcProcessor, DvcServerProcessor};
++use ironrdp_pdu::{PduResult, pdu_other_err};
++use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
++use tracing::{debug, trace, warn};
++
++use crate::CHANNEL_NAME;
++use crate::pdu::{DataPdu, FormatChangePdu, FormatsPdu, OpenPdu, OpenReplyPdu, RdpeaiPdu, Version, VersionPdu};
++
++pub trait RdpeaiError: core::error::Error + Send + Sync + 'static {}
++
++impl<T> RdpeaiError for T where T: core::error::Error + Send + Sync + 'static {}
++
++/// Message sent by the embedding application's event loop to drive [`RdpeaiServer`] from
++/// outside the DVC message-processing path — e.g. once a consumer decides it wants to start
++/// recording, or wants to switch formats mid-session.
++#[derive(Debug)]
++pub enum RdpeaiServerMessage {
++    /// Request the client start recording. See [`RdpeaiServer::open`].
++    Open {
++        frames_per_packet: u32,
++        initial_format: u32,
++        capture_format: AudioFormat,
++    },
++    /// Request the client switch to a different negotiated format. See
++    /// [`RdpeaiServer::change_format`].
++    ChangeFormat { new_format: u32 },
++    /// Failure received from the embedding application's own capture/consumer pipeline.
++    /// Implementations should log/display this error.
++    Error(Box<dyn RdpeaiError>),
++}
++
++/// Handler for the server side of the Audio Input Redirection Virtual Channel (`AUDIO_INPUT`).
++///
++/// Implementations supply the list of audio formats the server offers and receive the
++/// client's captured audio once [`RdpeaiServer::open`] succeeds. `RdpeaiServer` owns the
++/// MS-RDPEAI state machine; the backend only reacts to negotiated state and produces raw
++/// audio bytes to consumers (e.g. a PipeWire virtual microphone source).
++pub trait RdpeaiServerBackend: Send {
++    /// Formats this server offers, in preferred order. Sent verbatim in the Sound Formats PDU
++    /// (MS-RDPEAI 2.2.2.2) once the client's Version PDU is processed.
++    fn supported_formats(&self) -> &[AudioFormat];
++
++    /// Called once the client has replied with its own Sound Formats PDU, establishing the
++    /// final negotiated list (MS-RDPEAI 3.3.5.1.5). `negotiated` is the client's subset, in the
++    /// client's order — the same list [`RdpeaiServer::open`]'s `initial_format` and
++    /// [`RdpeaiServer::change_format`]'s `new_format` index into. May be empty if the client
++    /// advertised no format the server also offers, in which case recording is unavailable
++    /// for the session.
++    fn on_formats_negotiated(&mut self, negotiated: &[AudioFormat]) {
++        let _ = negotiated;
++    }
++
++    /// Called when the client answers an Open PDU (MS-RDPEAI 3.3.5.1.8). `result` is the
++    /// client's raw HRESULT; per MS-RDPEAI 3.3.5.1.8 an HRESULT is an error only when its
++    /// sign bit is set, so `result >= 0` (not just [`OpenReplyPdu::S_OK`]) means capture
++    /// started.
++    fn on_open_reply(&mut self, result: i32) {
++        let _ = result;
++    }
++
++    /// Called for every decoded audio packet the client sends while opened
++    /// (MS-RDPEAI 3.3.5.2.2). `format` is the format currently in effect. `data` is the raw
++    /// payload from the Data PDU, encoded per `format` — this crate does not decode compressed
++    /// formats; PCM formats are already raw samples.
++    fn on_audio_data(&mut self, format: &AudioFormat, data: &[u8]);
++
++    /// Called once the client confirms a server-initiated format change
++    /// (MS-RDPEAI 3.3.5.3.2). Not called for the initial format confirm that precedes the
++    /// first Open Reply — see [`Self::on_open_reply`] for that.
++    fn on_format_change_confirmed(&mut self, format: &AudioFormat) {
++        let _ = format;
++    }
++
++    /// Called when the dynamic virtual channel is torn down.
++    fn on_close(&mut self) {}
++}
++
++/// A [`RdpeaiServerBackend`] that offers no formats and drops all audio.
++#[derive(Debug, Default)]
++pub struct NoopRdpeaiServerBackend;
++
++impl RdpeaiServerBackend for NoopRdpeaiServerBackend {
++    fn supported_formats(&self) -> &[AudioFormat] {
++        &[]
++    }
++
++    fn on_audio_data(&mut self, _format: &AudioFormat, _data: &[u8]) {}
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum State {
++    /// Channel not yet started.
++    Start,
++    /// Server Version PDU sent; waiting for the client's Version PDU.
++    AwaitingClientVersion,
++    /// Server Formats PDU sent; waiting for the client's Formats PDU.
++    AwaitingClientFormats,
++    /// Formats negotiated; no Open outstanding.
++    Ready,
++    /// Open PDU sent; waiting for the client's FormatChange confirming the initial format.
++    AwaitingFormatConfirm,
++    /// Initial FormatChange confirmed; waiting for the client's Open Reply.
++    AwaitingOpenReply,
++    /// Capture device open; Data PDUs expected.
++    Opened,
++}
++
++/// Server processor for the `AUDIO_INPUT` dynamic virtual channel (MS-RDPEAI).
++///
++/// Drives the initialization sequence automatically on channel start (Version, then Formats,
++/// per 3.3.5.1.1-3.3.5.1.5): the server always advertises its formats immediately, since
++/// nothing in the protocol depends on a higher-layer "start recording" decision until
++/// [`Self::open`] is called. Recording itself is caller-initiated: call [`Self::open`] once
++/// the negotiated formats are known ([`RdpeaiServerBackend::on_formats_negotiated`]) and the
++/// consuming application actually wants to record, then forward the returned PDUs to the
++/// client over the channel id this processor was created for (recover it with
++/// [`ironrdp_dvc::DrdynvcServer::get_channel_id_by_type`]).
++///
++/// Malformed, unrecognized, or out-of-sequence PDUs are logged and ignored rather than
++/// treated as errors, per MS-RDPEAI 3.1.5's explicit MUST-ignore requirement.
++pub struct RdpeaiServer {
++    backend: Box<dyn RdpeaiServerBackend>,
++    state: State,
++    client_version: Option<Version>,
++    /// Negotiated format list, in the client's reply order — Open/FormatChange indices refer
++    /// here (MS-RDPEAI 3.1.1: this is the list the client establishes as final).
++    negotiated_formats: Vec<AudioFormat>,
++    /// Index into `negotiated_formats` currently in effect once opened.
++    current_format: Option<u32>,
++    /// `initialFormat` from the outstanding Open PDU, pending the client's confirming
++    /// FormatChange.
++    pending_open_format: Option<u32>,
++    /// `NewFormat` from an outstanding server-initiated FormatChange, pending confirm.
++    pending_format_change: Option<u32>,
++}
++
++impl RdpeaiServer {
++    pub fn new(backend: Box<dyn RdpeaiServerBackend>) -> Self {
++        Self {
++            backend,
++            state: State::Start,
++            client_version: None,
++            negotiated_formats: Vec::new(),
++            current_format: None,
++            pending_open_format: None,
++            pending_format_change: None,
++        }
++    }
++
++    /// Clear all per-connection state, transitioning to `state`. Shared by
++    /// [`DvcProcessor::start`] (transitions to `AwaitingClientVersion`) and
++    /// [`DvcProcessor::close`] (transitions to `Start`), so the two reset sequences can't
++    /// drift apart as fields are added.
++    fn reset(&mut self, state: State) {
++        self.state = state;
++        self.client_version = None;
++        self.negotiated_formats.clear();
++        self.current_format = None;
++        self.pending_open_format = None;
++        self.pending_format_change = None;
++    }
++
++    /// Formats negotiated with the client (MS-RDPEAI 3.3.5.1.5); empty before that completes
++    /// or if no common format exists.
++    pub fn negotiated_formats(&self) -> &[AudioFormat] {
++        &self.negotiated_formats
++    }
++
++    /// The format currently in effect, once [`Self::open`] has succeeded.
++    pub fn current_format(&self) -> Option<&AudioFormat> {
++        self.current_format.and_then(|idx| self.resolve_format(idx))
++    }
++
++    /// The protocol version the client advertised, once its Version PDU has been processed.
++    pub fn client_version(&self) -> Option<Version> {
++        self.client_version
++    }
++
++    fn resolve_format(&self, index: u32) -> Option<&AudioFormat> {
++        let idx = usize::try_from(index).ok()?;
++        self.negotiated_formats.get(idx)
++    }
++
++    /// Request the client start recording (MS-RDPEAI 3.3.5.1.6 / 3.1.4.1).
++    ///
++    /// `initial_format` indexes [`Self::negotiated_formats`] and selects the encoding used for
++    /// captured Data PDUs; `capture_format` is the WAVEFORMATEX the client's capture device is
++    /// asked to open with (MS-RDPEAI 2.2.2.3) and MAY differ from the encoding format when the
++    /// client captures PCM and encodes afterward. `frames_per_packet` bounds each Data PDU to
++    /// `nChannels * 2 * FramesPerPacket` bytes (2.2.2.3 / 2.2.3.2).
++    ///
++    /// Valid only once formats are negotiated and no Open is already outstanding or active;
++    /// returns an error otherwise rather than sending a second, contract-violating Open PDU.
++    /// Errors are returned, not panics, since the caller may race the negotiation completing.
++    pub fn open(
++        &mut self,
++        frames_per_packet: u32,
++        initial_format: u32,
++        capture_format: AudioFormat,
++    ) -> PduResult<Vec<DvcMessage>> {
++        if self.state != State::Ready {
++            return Err(pdu_other_err!("RdpeaiServer::open called outside the Ready state"));
++        }
++        if self.resolve_format(initial_format).is_none() {
++            return Err(pdu_other_err!("RdpeaiServer::open initial_format out of range"));
++        }
++
++        self.pending_open_format = Some(initial_format);
++        self.state = State::AwaitingFormatConfirm;
++
++        Ok(vec![Box::new(RdpeaiPdu::Open(OpenPdu {
++            frames_per_packet,
++            initial_format,
++            capture_format,
++        }))])
++    }
++
++    /// Request the client switch to a different negotiated format while streaming
++    /// (MS-RDPEAI 3.3.5.3.1). `new_format` indexes [`Self::negotiated_formats`].
++    ///
++    /// Per 3.3.5.3.1, when the currently active format is AAC and the client only advertised
++    /// protocol version 1, the server SHOULD NOT send this PDU: that case logs a warning and
++    /// returns no messages rather than sending a PDU the spec discourages. Valid only while
++    /// [`Self::current_format`] is set (i.e. after a successful [`Self::open`]).
++    pub fn change_format(&mut self, new_format: u32) -> PduResult<Vec<DvcMessage>> {
++        if self.state != State::Opened {
++            return Err(pdu_other_err!(
++                "RdpeaiServer::change_format called outside the Opened state"
++            ));
++        }
++        if self.resolve_format(new_format).is_none() {
++            return Err(pdu_other_err!("RdpeaiServer::change_format new_format out of range"));
++        }
++
++        let active_is_aac = self
++            .current_format()
++            .is_some_and(|fmt| fmt.format == WaveFormat::AAC_MS);
++        if active_is_aac && self.client_version == Some(Version::V1) {
++            warn!(
++                "Skipping AUDIO_INPUT FormatChange: active format is AAC and the client only \
++                 advertised protocol version 1 (MS-RDPEAI 3.3.5.3.1 SHOULD NOT)"
++            );
++            return Ok(Vec::new());
++        }
++
++        self.pending_format_change = Some(new_format);
++        Ok(vec![Box::new(RdpeaiPdu::FormatChange(FormatChangePdu::new(
++            new_format,
++        )))])
++    }
++
++    fn handle_version(&mut self, pdu: VersionPdu) -> PduResult<Vec<DvcMessage>> {
++        if self.state != State::AwaitingClientVersion {
++            warn!(?self.state, "Ignoring out-of-sequence AUDIO_INPUT Version PDU");
++            return Ok(Vec::new());
++        }
++        self.client_version = Some(pdu.version);
++        self.state = State::AwaitingClientFormats;
++        debug!(client_version = ?pdu.version, "AUDIO_INPUT version received");
++        // MS-RDPEAI 3.3.5.1.3: the server MUST send a Sound Formats PDU after processing the
++        // client's Version PDU.
++        Ok(vec![Box::new(RdpeaiPdu::Formats(FormatsPdu::server(
++            self.backend.supported_formats().to_vec(),
++        )))])
++    }
++
++    fn handle_formats(&mut self, client: FormatsPdu) -> PduResult<Vec<DvcMessage>> {
++        if self.state != State::AwaitingClientFormats {
++            warn!(?self.state, "Ignoring out-of-sequence AUDIO_INPUT Formats PDU");
++            return Ok(Vec::new());
++        }
++
++        // MS-RDPEAI 3.2.5.1.5: the client's list MUST be a subset of what the server offered.
++        // Enforce defensively rather than trusting the client's claim verbatim.
++        let offered = self.backend.supported_formats();
++        let negotiated: Vec<AudioFormat> = client
++            .formats
++            .into_iter()
++            .filter(|fmt| offered.iter().any(|server_fmt| fmt.matches_for_negotiation(server_fmt)))
++            .collect();
++
++        if negotiated.is_empty() {
++            warn!("No common AUDIO_INPUT formats after client reply; recording is unavailable this session");
++        } else {
++            debug!(count = negotiated.len(), "AUDIO_INPUT formats negotiated");
++        }
++
++        self.negotiated_formats = negotiated;
++        self.state = State::Ready;
++        self.backend.on_formats_negotiated(&self.negotiated_formats);
++        Ok(Vec::new())
++    }
++
++    fn handle_format_change(&mut self, pdu: FormatChangePdu) -> PduResult<Vec<DvcMessage>> {
++        match self.state {
++            State::AwaitingFormatConfirm => {
++                // MS-RDPEAI 3.3.5.1.7: before the Open Reply, the client confirms the initial
++                // format chosen by the server's Open PDU.
++                let Some(pending) = self.pending_open_format else {
++                    warn!("AwaitingFormatConfirm with no pending Open format; ignoring");
++                    return Ok(Vec::new());
++                };
++                if pdu.new_format != pending {
++                    // MS-RDPEAI 3.1.5: a non-conformant confirm MUST be ignored, not trusted.
++                    // Keep the server-requested index rather than the client's divergent echo.
++                    warn!(
++                        expected = pending,
++                        got = pdu.new_format,
++                        "Initial AUDIO_INPUT FormatChange confirm does not match the format from Open; \
++                         keeping the requested format"
++                    );
++                }
++                self.current_format = Some(pending);
++                self.pending_open_format = None;
++                self.state = State::AwaitingOpenReply;
++                Ok(Vec::new())
++            }
++            State::Opened => {
++                // MS-RDPEAI 3.3.5.3.2: client confirms a server-initiated format change.
++                let Some(pending) = self.pending_format_change.take() else {
++                    warn!("Unsolicited AUDIO_INPUT FormatChange confirm while Opened; ignoring");
++                    return Ok(Vec::new());
++                };
++                if pdu.new_format != pending {
++                    // MS-RDPEAI 3.1.5: a non-conformant confirm MUST be ignored, not trusted.
++                    // Keep the server-requested index rather than the client's divergent echo.
++                    warn!(
++                        expected = pending,
++                        got = pdu.new_format,
++                        "AUDIO_INPUT FormatChange confirm does not match the requested format; \
++                         keeping the requested format"
++                    );
++                }
++                self.current_format = Some(pending);
++                if let Some(fmt) = self.current_format().cloned() {
++                    self.backend.on_format_change_confirmed(&fmt);
++                }
++                Ok(Vec::new())
++            }
++            _ => {
++                warn!(?self.state, "Ignoring out-of-sequence AUDIO_INPUT FormatChange PDU");
++                Ok(Vec::new())
++            }
++        }
++    }
++
++    fn handle_open_reply(&mut self, pdu: OpenReplyPdu) -> PduResult<Vec<DvcMessage>> {
++        match self.state {
++            State::AwaitingOpenReply => {
++                self.backend.on_open_reply(pdu.result);
++                // MS-RDPEAI 3.3.5.1.8: an HRESULT is an error only when its sign bit is set,
++                // so any non-negative result (not just S_OK) is success.
++                if pdu.result >= 0 {
++                    self.state = State::Opened;
++                    debug!("AUDIO_INPUT capture opened");
++                } else {
++                    // MS-RDPEAI 3.3.5.1.8: on failure the server MAY send another Open PDU;
++                    // leave that to the caller by returning to Ready rather than retrying
++                    // automatically.
++                    self.current_format = None;
++                    self.state = State::Ready;
++                    warn!(
++                        result = pdu.result,
++                        "AUDIO_INPUT client failed to open its capture device"
++                    );
++                }
++            }
++            State::AwaitingFormatConfirm => {
++                // A client rejecting Open before confirming the initial format (e.g.
++                // initialFormat out of range, or FramesPerPacket rejected) skips the
++                // FormatChange confirm and replies with OpenReply failure directly.
++                // 3.3.5.1.8 only conditions the server's reaction on the Result field, not on
++                // a preceding FormatChange, so accept it here too rather than leaving the
++                // channel wedged in AwaitingFormatConfirm with no path back to Ready.
++                self.backend.on_open_reply(pdu.result);
++                self.pending_open_format = None;
++                self.current_format = None;
++                self.state = State::Ready;
++                warn!(
++                    result = pdu.result,
++                    "AUDIO_INPUT client rejected Open before confirming the initial format"
++                );
++            }
++            _ => {
++                warn!(?self.state, "Ignoring out-of-sequence AUDIO_INPUT OpenReply PDU");
++            }
++        }
++        Ok(Vec::new())
++    }
++
++    fn handle_data(&mut self, pdu: DataPdu) -> PduResult<Vec<DvcMessage>> {
++        if self.state != State::Opened {
++            warn!(?self.state, "Ignoring AUDIO_INPUT Data PDU outside the Opened state");
++            return Ok(Vec::new());
++        }
++        let Some(format) = self.current_format().cloned() else {
++            warn!("Opened with no current format resolved; dropping audio data");
++            return Ok(Vec::new());
++        };
++        self.backend.on_audio_data(&format, &pdu.data);
++        Ok(Vec::new())
++    }
++}
++
++impl_as_any!(RdpeaiServer);
++
++impl DvcProcessor for RdpeaiServer {
++    fn channel_name(&self) -> &str {
++        CHANNEL_NAME
++    }
++
++    fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
++        self.reset(State::AwaitingClientVersion);
++        debug!(channel_id, "AUDIO_INPUT channel started");
++        // MS-RDPEAI 3.3.5.1.1: the Version PDU MUST be the first PDU sent by the server.
++        Ok(vec![Box::new(RdpeaiPdu::Version(VersionPdu::new(Version::V2)))])
++    }
++
++    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
++        // MS-RDPEAI 3.1.5: malformed or unrecognized PDUs MUST be ignored rather than
++        // treated as errors. A decode failure must not propagate: this processor is
++        // reached through the shared DRDYNVC SVC processor, so an Err here would fail
++        // the whole dynamic-channel message loop, not just this channel.
++        let pdu: RdpeaiPdu = match decode(payload) {
++            Ok(pdu) => pdu,
++            Err(e) => {
++                warn!(error = %e, "Ignoring malformed AUDIO_INPUT PDU");
++                return Ok(Vec::new());
++            }
++        };
++        trace!("AUDIO_INPUT PDU received");
++        match pdu {
++            RdpeaiPdu::Version(v) => self.handle_version(v),
++            RdpeaiPdu::Formats(f) => self.handle_formats(f),
++            RdpeaiPdu::FormatChange(c) => self.handle_format_change(c),
++            RdpeaiPdu::OpenReply(r) => self.handle_open_reply(r),
++            // MS-RDPEAI 3.3.5.1.4 / 3.3.5.2.1: diagnostic only, precedes Formats or Data.
++            RdpeaiPdu::DataIncoming => Ok(Vec::new()),
++            RdpeaiPdu::Data(d) => self.handle_data(d),
++            RdpeaiPdu::Open(_) => {
++                warn!("Ignoring server-originated AUDIO_INPUT Open PDU received from the client");
++                Ok(Vec::new())
++            }
++        }
++    }
++
++    fn close(&mut self, _channel_id: u32) {
++        self.backend.on_close();
++        self.reset(State::Start);
++        debug!("AUDIO_INPUT channel closed");
++    }
++}
++
++impl DvcServerProcessor for RdpeaiServer {}
+diff --git c/crates/ironrdp-server/Cargo.toml w/crates/ironrdp-server/Cargo.toml
+index ea9c5b7..b35b97e 100644
+--- c/crates/ironrdp-server/Cargo.toml
++++ w/crates/ironrdp-server/Cargo.toml
+@@ -57,6 +57,7 @@ ironrdp-graphics = { path = "../ironrdp-graphics", version = "0.9" } # public
+ ironrdp-rdpdr = { path = "../ironrdp-rdpdr", version = "0.7" } # public
+ ironrdp-rdpsnd = { path = "../ironrdp-rdpsnd", version = "0.9" } # public
+ ironrdp-rdpei = { path = "../ironrdp-rdpei", version = "0.1" } # public
++ironrdp-rdpeai = { path = "../ironrdp-rdpeai", version = "0.1" } # public
+ ironrdp-rdpeusb = { path = "../ironrdp-rdpeusb", version = "0.1", optional = true }
+ ironrdp-usb = { path = "../ironrdp-usb", version = "0.1", optional = true }
+ tracing = { version = "0.1", features = ["log"] }
+diff --git c/crates/ironrdp-server/src/builder.rs w/crates/ironrdp-server/src/builder.rs
+index 304bf5f..5ffc577 100644
+--- c/crates/ironrdp-server/src/builder.rs
++++ w/crates/ironrdp-server/src/builder.rs
+@@ -18,7 +18,10 @@ use super::server::{
+ use crate::error::ServerResult;
+ #[cfg(feature = "usb")]
+ use crate::urbdrc::DeviceFactory;
+-use crate::{DisplayUpdate, RdpServerDisplayUpdates, RdpdrServerFactory, RdpeiServerFactory, SoundServerFactory};
++use crate::{
++    DisplayUpdate, RdpServerDisplayUpdates, RdpdrServerFactory, RdpeaiServerFactory, RdpeiServerFactory,
++    SoundServerFactory,
++};
+ 
+ pub struct WantsAddr {}
+ pub struct WantsSecurity {
+@@ -45,6 +48,7 @@ pub struct BuilderDone {
+     sound_factory: Option<Box<dyn SoundServerFactory>>,
+     rdpei_factory: Option<Box<dyn RdpeiServerFactory>>,
+     rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
++    rdpeai_factory: Option<Box<dyn RdpeaiServerFactory>>,
+     connection_handler: Option<Box<dyn ConnectionHandler>>,
+     credential_validator: Option<Arc<dyn CredentialValidator>>,
+     #[cfg(feature = "egfx")]
+@@ -155,6 +159,7 @@ impl RdpServerBuilder<WantsDisplay> {
+                 cliprdr_factory: None,
+                 rdpei_factory: None,
+                 rdpdr_factory: None,
++                rdpeai_factory: None,
+                 connection_handler: None,
+                 credential_validator: None,
+                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
+@@ -188,6 +193,7 @@ impl RdpServerBuilder<WantsDisplay> {
+                 cliprdr_factory: None,
+                 rdpei_factory: None,
+                 rdpdr_factory: None,
++                rdpeai_factory: None,
+                 connection_handler: None,
+                 credential_validator: None,
+                 codecs: server_codecs_capabilities(&[]).expect("can't panic for &[]"),
+@@ -238,6 +244,12 @@ impl RdpServerBuilder<BuilderDone> {
+         self
+     }
+ 
++    /// Configure MS-RDPEAI (audio input / microphone redirection over a dynamic channel).
++    pub fn with_rdpeai_factory(mut self, rdpeai_factory: Option<Box<dyn RdpeaiServerFactory>>) -> Self {
++        self.state.rdpeai_factory = rdpeai_factory;
++        self
++    }
++
+     /// Configure EGFX (Graphics Pipeline Extension) for H.264 video streaming.
+     #[cfg(feature = "egfx")]
+     pub fn with_gfx_factory(mut self, gfx_factory: Option<Box<dyn GfxServerFactory>>) -> Self {
+@@ -478,6 +490,7 @@ impl RdpServerBuilder<BuilderDone> {
+             self.state.cliprdr_factory,
+             self.state.rdpei_factory,
+             self.state.rdpdr_factory,
++            self.state.rdpeai_factory,
+             self.state.connection_handler,
+             #[cfg(feature = "egfx")]
+             self.state.gfx_factory,
+diff --git c/crates/ironrdp-server/src/lib.rs w/crates/ironrdp-server/src/lib.rs
+index 4dffa3f..13b8d22 100644
+--- c/crates/ironrdp-server/src/lib.rs
++++ w/crates/ironrdp-server/src/lib.rs
+@@ -19,6 +19,7 @@ pub mod heartbeat;
+ #[cfg(feature = "helper")]
+ mod helper;
+ mod rdpdr;
++mod rdpeai;
+ mod rdpei;
+ mod server;
+ mod sound;
+@@ -43,6 +44,7 @@ pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
+ #[cfg(feature = "usb")]
+ pub use ironrdp_rdpeusb::io::{CompletionData, DeviceAnnounce, DeviceText, InternalIoControlPacket};
+ pub use rdpdr::{NoopRdpdrServerBackend, RdpdrServerBackend, RdpdrServerFactory, RdpdrServerMessage};
++pub use rdpeai::{NoopRdpeaiServerBackend, RdpeaiServerBackend, RdpeaiServerFactory, RdpeaiServerMessage};
+ pub use rdpei::{
+     CsReadyFlags, CsReadyPdu, DismissHoveringTouchContactPdu, PenContact, PenContactDataFlags, PenContactFields,
+     PenContactFlags, PenEventPdu, PenFlags, PenFrame, RdpInputProtocolVersion, RdpeiHandler, RdpeiServer,
+diff --git c/crates/ironrdp-server/src/rdpeai.rs w/crates/ironrdp-server/src/rdpeai.rs
+new file mode 100644
+index 0000000..9bd7ed4
+--- /dev/null
++++ w/crates/ironrdp-server/src/rdpeai.rs
+@@ -0,0 +1,7 @@
++pub use ironrdp_rdpeai::server::{NoopRdpeaiServerBackend, RdpeaiServerBackend, RdpeaiServerMessage};
++
++use crate::ServerEventSender;
++
++pub trait RdpeaiServerFactory: ServerEventSender {
++    fn build_backend(&self) -> Box<dyn RdpeaiServerBackend>;
++}
+diff --git c/crates/ironrdp-server/src/server.rs w/crates/ironrdp-server/src/server.rs
+index 0695f54..7a8cb00 100644
+--- c/crates/ironrdp-server/src/server.rs
++++ w/crates/ironrdp-server/src/server.rs
+@@ -35,11 +35,13 @@ use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, Se
+ use ironrdp_pdu::x224::X224;
+ use ironrdp_pdu::{Action, PduResult, decode_err, mcs, nego, rdp};
+ use ironrdp_rdpdr as rdpdr;
++use ironrdp_rdpeai as rdpeai;
+ use ironrdp_rdpsnd as rdpsnd;
+ use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcProcessor, server_encode_svc_messages};
+ use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, unsplit_tokio_framed};
+ use rand::RngCore as _;
+ use rdpdr::server::{RdpdrServer, RdpdrServerMessage};
++use rdpeai::server::{RdpeaiServer, RdpeaiServerMessage};
+ use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
+ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+ use tokio::net::{TcpSocket, TcpStream};
+@@ -58,6 +60,7 @@ use crate::error::{ServerError, ServerErrorExt as _, ServerErrorKind, ServerResu
+ use crate::gfx::{EgfxServerMessage, GfxServerFactory};
+ use crate::handler::RdpServerInputHandler;
+ use crate::heartbeat::HeartbeatConfig;
++use crate::rdpeai::RdpeaiServerFactory;
+ use crate::rdpei::RdpeiServerFactory;
+ #[cfg(feature = "usb")]
+ use crate::urbdrc::{
+@@ -648,6 +651,7 @@ pub struct RdpServer {
+     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+     rdpei_factory: Option<Box<dyn RdpeiServerFactory>>,
+     rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
++    rdpeai_factory: Option<Box<dyn RdpeaiServerFactory>>,
+     echo_handle: EchoServerHandle,
+     #[cfg(feature = "egfx")]
+     gfx_factory: Option<Box<dyn GfxServerFactory>>,
+@@ -816,6 +820,7 @@ pub enum ServerEvent {
+     Clipboard(ClipboardMessage),
+     Rdpsnd(RdpsndServerMessage),
+     Rdpdr(RdpdrServerMessage),
++    Rdpeai(RdpeaiServerMessage),
+     Echo(EchoServerMessage),
+     SetCredentials(Credentials),
+     /// Replace or clear the Server Auto-Reconnect Cookie.
+@@ -847,6 +852,7 @@ impl fmt::Debug for ServerEvent {
+             Self::Clipboard(..) => f.write_str("Clipboard(..)"),
+             Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
+             Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
++            Self::Rdpeai(..) => f.write_str("Rdpeai(..)"),
+             Self::Echo(..) => f.write_str("Echo(..)"),
+             Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
+             Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
+@@ -1325,6 +1331,11 @@ impl RdpServer {
+         clippy::too_many_arguments,
+         reason = "called via the builder; positional parameters are an internal detail"
+     )]
++    #[expect(
++        clippy::similar_names,
++        reason = "rdpei (MS-RDPEI touch/pen) and rdpeai (MS-RDPEAI audio input) are distinct protocols \
++                  whose names happen to be textually close; renaming either would be less accurate"
++    )]
+     pub(crate) fn new(
+         opts: RdpServerOptions,
+         handler: Box<dyn RdpServerInputHandler>,
+@@ -1334,6 +1345,7 @@ impl RdpServer {
+         mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+         mut rdpei_factory: Option<Box<dyn RdpeiServerFactory>>,
+         mut rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
++        mut rdpeai_factory: Option<Box<dyn RdpeaiServerFactory>>,
+         connection_handler: Option<Box<dyn ConnectionHandler>>,
+         #[cfg(feature = "egfx")] mut gfx_factory: Option<Box<dyn GfxServerFactory>>,
+         display_suppressed: Option<Arc<AtomicBool>>,
+@@ -1355,6 +1367,9 @@ impl RdpServer {
+         if let Some(rdpdr) = rdpdr_factory.as_mut() {
+             rdpdr.set_sender(ev_sender.clone());
+         }
++        if let Some(rdpeai) = rdpeai_factory.as_mut() {
++            rdpeai.set_sender(ev_sender.clone());
++        }
+         #[cfg(feature = "egfx")]
+         if let Some(gfx) = gfx_factory.as_mut() {
+             gfx.set_sender(ev_sender.clone());
+@@ -1370,6 +1385,7 @@ impl RdpServer {
+             cliprdr_factory,
+             rdpei_factory,
+             rdpdr_factory,
++            rdpeai_factory,
+             echo_handle: EchoServerHandle::new(ev_sender.clone()),
+             #[cfg(feature = "egfx")]
+             gfx_factory,
+@@ -1831,6 +1847,13 @@ impl RdpServer {
+             dvc
+         };
+ 
++        let dvc = if let Some(factory) = self.rdpeai_factory.as_deref() {
++            let backend = factory.build_backend();
++            dvc.with_dynamic_channel(RdpeaiServer::new(backend))
++        } else {
++            dvc
++        };
++
+         #[cfg(feature = "egfx")]
+         let dvc = {
+             let mut dvc = dvc;
+@@ -2818,6 +2841,62 @@ impl RdpServer {
+                         .await
+                         .map_err(|e| ServerError::io("write_all", e))?;
+                 }
++                ServerEvent::Rdpeai(msg) => {
++                    let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
++                        warn!("No drdynvc channel, dropping AUDIO_INPUT event");
++                        continue;
++                    };
++                    let Some(channel_id) = drdynvc.get_channel_id_by_type::<RdpeaiServer>() else {
++                        warn!("No AUDIO_INPUT dynamic channel, dropping event");
++                        continue;
++                    };
++                    // dvc_by_id_mut already returns None for a channel that isn't yet
++                    // Opened, and that case is handled just below; a separate
++                    // is_channel_opened check here would only duplicate it.
++                    let Some(mut rdpeai) = drdynvc.dvc_by_id_mut::<RdpeaiServer>(channel_id) else {
++                        warn!("AUDIO_INPUT channel not opened or not found by id, dropping event");
++                        continue;
++                    };
++                    let result = match msg {
++                        RdpeaiServerMessage::Open {
++                            frames_per_packet,
++                            initial_format,
++                            capture_format,
++                        } => rdpeai
++                            .processor_mut()
++                            .open(frames_per_packet, initial_format, capture_format),
++                        RdpeaiServerMessage::ChangeFormat { new_format } => {
++                            rdpeai.processor_mut().change_format(new_format)
++                        }
++                        RdpeaiServerMessage::Error(error) => {
++                            error!(?error, "Handling AUDIO_INPUT event");
++                            continue;
++                        }
++                    };
++                    // open()/change_format() reject calls that race the channel's current
++                    // state (e.g. Open before negotiation finishes); that is an expected,
++                    // recoverable condition per their own doc comments, not a connection
++                    // fault, so drop-and-warn like every other unavailability in this arm
++                    // rather than tearing down the session.
++                    let msgs = match result {
++                        Ok(msgs) => msgs,
++                        Err(error) => {
++                            warn!(%error, "AUDIO_INPUT event rejected by current channel state, dropping");
++                            continue;
++                        }
++                    };
++                    let dvc_messages = dvc::encode_dvc_messages(channel_id, msgs, ChannelFlags::SHOW_PROTOCOL)
++                        .map_err(ServerError::encode)?;
++                    let drdynvc_channel_id = self
++                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
++                        .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
++                    let data = server_encode_svc_messages(dvc_messages, drdynvc_channel_id, user_channel_id)
++                        .map_err(ServerError::encode)?;
++                    writer
++                        .write_all(&data)
++                        .await
++                        .map_err(|e| ServerError::io("write_all", e))?;
++                }
+                 ServerEvent::Clipboard(c) => {
+                     let Some(cliprdr) = self.get_svc_processor::<CliprdrServer>() else {
+                         warn!("No clipboard channel, dropping event");
+diff --git c/crates/ironrdp-testsuite-core/tests/rdpeai/mod.rs w/crates/ironrdp-testsuite-core/tests/rdpeai/mod.rs
+index 8ef9d10..b180621 100644
+--- c/crates/ironrdp-testsuite-core/tests/rdpeai/mod.rs
++++ w/crates/ironrdp-testsuite-core/tests/rdpeai/mod.rs
+@@ -1,2 +1,3 @@
+ mod client;
+ mod pdu;
++mod server;
+diff --git c/crates/ironrdp-testsuite-core/tests/rdpeai/server.rs w/crates/ironrdp-testsuite-core/tests/rdpeai/server.rs
+new file mode 100644
+index 0000000..08a50a2
+--- /dev/null
++++ w/crates/ironrdp-testsuite-core/tests/rdpeai/server.rs
+@@ -0,0 +1,459 @@
++use std::sync::{Arc, Mutex};
++
++use ironrdp_core::{decode, encode_vec};
++use ironrdp_dvc::DvcProcessor as _;
++use ironrdp_rdpeai::pdu::{
++    DataPdu, FormatChangePdu, FormatsPdu, OpenPdu, OpenReplyPdu, RdpeaiPdu, Version, VersionPdu, pcm_format,
++};
++use ironrdp_rdpeai::server::{NoopRdpeaiServerBackend, RdpeaiServer, RdpeaiServerBackend};
++use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
++
++#[derive(Default)]
++struct MockBackendState {
++    negotiated: Vec<AudioFormat>,
++    open_replies: Vec<i32>,
++    audio: Vec<(AudioFormat, Vec<u8>)>,
++    format_changes: Vec<AudioFormat>,
++    closed: bool,
++}
++
++#[derive(Clone, Default)]
++struct MockBackend {
++    formats: Vec<AudioFormat>,
++    state: Arc<Mutex<MockBackendState>>,
++}
++
++impl MockBackend {
++    fn new(formats: Vec<AudioFormat>) -> Self {
++        Self {
++            formats,
++            state: Arc::new(Mutex::new(MockBackendState::default())),
++        }
++    }
++}
++
++impl RdpeaiServerBackend for MockBackend {
++    fn supported_formats(&self) -> &[AudioFormat] {
++        &self.formats
++    }
++
++    fn on_formats_negotiated(&mut self, negotiated: &[AudioFormat]) {
++        self.state.lock().unwrap().negotiated = negotiated.to_vec();
++    }
++
++    fn on_open_reply(&mut self, result: i32) {
++        self.state.lock().unwrap().open_replies.push(result);
++    }
++
++    fn on_audio_data(&mut self, format: &AudioFormat, data: &[u8]) {
++        self.state.lock().unwrap().audio.push((format.clone(), data.to_vec()));
++    }
++
++    fn on_format_change_confirmed(&mut self, format: &AudioFormat) {
++        self.state.lock().unwrap().format_changes.push(format.clone());
++    }
++
++    fn on_close(&mut self) {
++        self.state.lock().unwrap().closed = true;
++    }
++}
++
++fn decode_dvc(msg: &ironrdp_dvc::DvcMessage) -> RdpeaiPdu {
++    let bytes = encode_vec(msg.as_ref()).expect("encode dvc message");
++    decode(&bytes).expect("decode dvc message")
++}
++
++fn process_encoded(server: &mut RdpeaiServer, channel_id: u32, pdu: RdpeaiPdu) -> Vec<ironrdp_dvc::DvcMessage> {
++    server
++        .process(channel_id, &encode_vec(&pdu).expect("encode"))
++        .expect("process")
++}
++
++/// Drive the server through Version -> Formats -> Open -> FormatChange confirm -> OpenReply.
++/// Every call site uses the same channel id, frames-per-packet, and initial format index, so
++/// those are fixed here rather than threaded through as parameters.
++fn negotiate_and_open(
++    server: &mut RdpeaiServer,
++    client_formats: Vec<AudioFormat>,
++    capture_format: AudioFormat,
++    open_result: i32,
++) {
++    let start_out = server.start(1).expect("start");
++    assert_eq!(start_out.len(), 1);
++    assert!(matches!(decode_dvc(&start_out[0]), RdpeaiPdu::Version(_)));
++
++    let version_out = process_encoded(server, 1, RdpeaiPdu::Version(VersionPdu::new(Version::V1)));
++    assert_eq!(version_out.len(), 1);
++    assert!(matches!(decode_dvc(&version_out[0]), RdpeaiPdu::Formats(_)));
++
++    let formats_out = process_encoded(server, 1, RdpeaiPdu::Formats(FormatsPdu::client(client_formats)));
++    assert!(formats_out.is_empty());
++
++    let open_out = server.open(320, 0, capture_format).expect("open");
++    assert_eq!(open_out.len(), 1);
++    assert!(matches!(decode_dvc(&open_out[0]), RdpeaiPdu::Open(_)));
++
++    let confirm_out = process_encoded(server, 1, RdpeaiPdu::FormatChange(FormatChangePdu::new(0)));
++    assert!(confirm_out.is_empty());
++
++    let reply_out = process_encoded(server, 1, RdpeaiPdu::OpenReply(OpenReplyPdu { result: open_result }));
++    assert!(reply_out.is_empty());
++}
++
++#[test]
++fn version_and_formats_negotiate_correctly() {
++    let fmt_a = pcm_format(1, 16000, 16);
++    let fmt_b = pcm_format(2, 48000, 16);
++    let backend = MockBackend::new(vec![fmt_a.clone(), fmt_b.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    let start_out = server.start(1).expect("start");
++    match decode_dvc(&start_out[0]) {
++        RdpeaiPdu::Version(v) => assert_eq!(v.version, Version::V2),
++        other => panic!("expected server Version PDU, got {other:?}"),
++    }
++
++    let version_out = process_encoded(&mut server, 1, RdpeaiPdu::Version(VersionPdu::new(Version::V1)));
++    match decode_dvc(&version_out[0]) {
++        RdpeaiPdu::Formats(f) => assert_eq!(f.formats, vec![fmt_a.clone(), fmt_b]),
++        other => panic!("expected server Formats PDU, got {other:?}"),
++    }
++
++    // Client accepts only fmt_a.
++    let _ = process_encoded(
++        &mut server,
++        1,
++        RdpeaiPdu::Formats(FormatsPdu::client(vec![fmt_a.clone()])),
++    );
++    assert_eq!(server.negotiated_formats(), &[fmt_a]);
++    assert_eq!(backend.state.lock().unwrap().negotiated, server.negotiated_formats());
++    assert_eq!(server.client_version(), Some(Version::V1));
++}
++
++#[test]
++fn formats_reply_is_filtered_to_the_servers_offered_set() {
++    // MS-RDPEAI 3.2.5.1.5: the client's list MUST be a subset of the server's; a
++    // non-conformant client claiming a format the server never offered must not poison
++    // the negotiated list.
++    let fmt_a = pcm_format(1, 16000, 16);
++    let unoffered = pcm_format(2, 96000, 24);
++    let backend = MockBackend::new(vec![fmt_a.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend));
++
++    server.start(1).unwrap();
++    let _ = process_encoded(&mut server, 1, RdpeaiPdu::Version(VersionPdu::new(Version::V1)));
++    let _ = process_encoded(
++        &mut server,
++        1,
++        RdpeaiPdu::Formats(FormatsPdu::client(vec![fmt_a.clone(), unoffered])),
++    );
++
++    assert_eq!(server.negotiated_formats(), &[fmt_a]);
++}
++
++#[test]
++fn open_through_data_delivers_audio_to_the_backend() {
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    negotiate_and_open(&mut server, vec![fmt.clone()], fmt.clone(), OpenReplyPdu::S_OK);
++
++    assert_eq!(backend.state.lock().unwrap().open_replies, vec![OpenReplyPdu::S_OK]);
++    assert_eq!(server.current_format(), Some(&fmt));
++
++    let data_out = process_encoded(&mut server, 1, RdpeaiPdu::Data(DataPdu::new(vec![1, 2, 3, 4])));
++    assert!(data_out.is_empty());
++
++    let audio = backend.state.lock().unwrap().audio.clone();
++    assert_eq!(audio, vec![(fmt, vec![1, 2, 3, 4])]);
++}
++
++#[test]
++fn data_before_open_is_ignored() {
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    server.start(1).unwrap();
++    let _ = process_encoded(&mut server, 1, RdpeaiPdu::Version(VersionPdu::new(Version::V1)));
++    let _ = process_encoded(&mut server, 1, RdpeaiPdu::Formats(FormatsPdu::client(vec![fmt])));
++
++    // Still Ready: no Open in flight yet.
++    let _ = process_encoded(&mut server, 1, RdpeaiPdu::Data(DataPdu::new(vec![9, 9, 9])));
++    assert!(backend.state.lock().unwrap().audio.is_empty());
++}
++
++#[test]
++fn open_rejects_out_of_range_initial_format() {
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend));
++
++    server.start(1).unwrap();
++    let _ = process_encoded(&mut server, 1, RdpeaiPdu::Version(VersionPdu::new(Version::V1)));
++    let _ = process_encoded(
++        &mut server,
++        1,
++        RdpeaiPdu::Formats(FormatsPdu::client(vec![fmt.clone()])),
++    );
++
++    assert!(server.open(320, 7, fmt).is_err());
++}
++
++#[test]
++fn open_rejects_when_not_yet_negotiated() {
++    let backend = NoopRdpeaiServerBackend;
++    let mut server = RdpeaiServer::new(Box::new(backend));
++    server.start(1).unwrap();
++    // Version/Formats round trip has not happened: state is not Ready.
++    assert!(server.open(320, 0, pcm_format(1, 16000, 16)).is_err());
++}
++
++#[test]
++fn open_reply_failure_returns_to_ready_and_allows_retry() {
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    negotiate_and_open(&mut server, vec![fmt.clone()], fmt.clone(), OpenReplyPdu::E_FAIL);
++
++    assert_eq!(backend.state.lock().unwrap().open_replies, vec![OpenReplyPdu::E_FAIL]);
++    assert_eq!(server.current_format(), None);
++
++    // MS-RDPEAI 3.3.5.1.8: on failure the server MAY retry Open; the state machine must
++    // allow it rather than being stuck.
++    assert!(server.open(320, 0, fmt).is_ok());
++}
++
++#[test]
++fn open_reply_failure_before_format_change_confirm_returns_to_ready() {
++    // The client rejects Open (e.g. initialFormat out of range, or FramesPerPacket rejected)
++    // by replying with OpenReply failure directly, without first confirming the initial
++    // format via FormatChange (ironrdp-rdpeai's own client does exactly this in
++    // handle_open). The server must accept that reply from AwaitingFormatConfirm, not just
++    // AwaitingOpenReply, or the channel is stuck forever with no path back to Ready.
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    server.start(1).expect("start");
++    process_encoded(&mut server, 1, RdpeaiPdu::Version(VersionPdu::new(Version::V1)));
++    process_encoded(
++        &mut server,
++        1,
++        RdpeaiPdu::Formats(FormatsPdu::client(vec![fmt.clone()])),
++    );
++    server.open(320, 0, fmt.clone()).expect("open");
++
++    // Skip the FormatChange confirm entirely; reply as if Open was rejected.
++    let reply_out = process_encoded(
++        &mut server,
++        1,
++        RdpeaiPdu::OpenReply(OpenReplyPdu {
++            result: OpenReplyPdu::E_FAIL,
++        }),
++    );
++    assert!(reply_out.is_empty());
++
++    assert_eq!(backend.state.lock().unwrap().open_replies, vec![OpenReplyPdu::E_FAIL]);
++    assert_eq!(server.current_format(), None);
++    assert!(server.open(320, 0, fmt).is_ok());
++}
++
++#[test]
++fn open_reply_with_a_non_s_ok_non_negative_result_is_treated_as_success() {
++    // MS-RDPEAI 3.3.5.1.8: an HRESULT is an error only when its sign bit is set, so any
++    // non-negative result is success, not just S_OK (0). S_FALSE (1) is one such code.
++    const S_FALSE: i32 = 1;
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    negotiate_and_open(&mut server, vec![fmt.clone()], fmt.clone(), S_FALSE);
++
++    assert_eq!(backend.state.lock().unwrap().open_replies, vec![S_FALSE]);
++    assert_eq!(server.current_format(), Some(&fmt));
++
++    let data_out = process_encoded(&mut server, 1, RdpeaiPdu::Data(DataPdu::new(vec![5, 6, 7])));
++    assert!(data_out.is_empty());
++    assert_eq!(backend.state.lock().unwrap().audio, vec![(fmt, vec![5, 6, 7])]);
++}
++
++#[test]
++fn change_format_round_trips_and_notifies_backend() {
++    let fmt_a = pcm_format(1, 16000, 16);
++    let fmt_b = pcm_format(1, 48000, 16);
++    let backend = MockBackend::new(vec![fmt_a.clone(), fmt_b.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    negotiate_and_open(
++        &mut server,
++        vec![fmt_a.clone(), fmt_b.clone()],
++        fmt_a,
++        OpenReplyPdu::S_OK,
++    );
++
++    let change_out = server.change_format(1).expect("change_format");
++    assert_eq!(change_out.len(), 1);
++    assert!(matches!(decode_dvc(&change_out[0]), RdpeaiPdu::FormatChange(_)));
++
++    let confirm_out = process_encoded(&mut server, 1, RdpeaiPdu::FormatChange(FormatChangePdu::new(1)));
++    assert!(confirm_out.is_empty());
++
++    assert_eq!(server.current_format(), Some(&fmt_b));
++    assert_eq!(backend.state.lock().unwrap().format_changes, vec![fmt_b]);
++}
++
++#[test]
++fn change_format_confirm_ignores_divergent_echo() {
++    // MS-RDPEAI 3.1.5: a confirm that echoes a different index than the server requested is
++    // non-conformant and MUST be ignored, not trusted, keeping the server-requested format.
++    let fmt_a = pcm_format(1, 16000, 16);
++    let fmt_b = pcm_format(1, 48000, 16);
++    let backend = MockBackend::new(vec![fmt_a.clone(), fmt_b.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    negotiate_and_open(
++        &mut server,
++        vec![fmt_a.clone(), fmt_b.clone()],
++        fmt_a,
++        OpenReplyPdu::S_OK,
++    );
++
++    let change_out = server.change_format(1).expect("change_format");
++    assert_eq!(change_out.len(), 1);
++
++    // Client echoes index 0 instead of the requested index 1.
++    let confirm_out = process_encoded(&mut server, 1, RdpeaiPdu::FormatChange(FormatChangePdu::new(0)));
++    assert!(confirm_out.is_empty());
++
++    assert_eq!(server.current_format(), Some(&fmt_b));
++    assert_eq!(backend.state.lock().unwrap().format_changes, vec![fmt_b]);
++}
++
++#[test]
++fn change_format_rejects_out_of_range() {
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend));
++
++    negotiate_and_open(&mut server, vec![fmt.clone()], fmt, OpenReplyPdu::S_OK);
++
++    assert!(server.change_format(5).is_err());
++}
++
++#[test]
++fn change_format_rejects_before_open() {
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend));
++
++    server.start(1).unwrap();
++    let _ = process_encoded(&mut server, 1, RdpeaiPdu::Version(VersionPdu::new(Version::V1)));
++    let _ = process_encoded(&mut server, 1, RdpeaiPdu::Formats(FormatsPdu::client(vec![fmt])));
++
++    assert!(server.change_format(0).is_err());
++}
++
++#[test]
++fn change_format_skips_when_active_format_is_aac_and_client_is_version_one() {
++    // MS-RDPEAI 3.3.5.3.1: if the client advertised only version 1 and the active format is
++    // AAC, the server SHOULD NOT send FormatChange.
++    let aac = AudioFormat {
++        format: WaveFormat::AAC_MS,
++        n_channels: 2,
++        n_samples_per_sec: 48000,
++        n_avg_bytes_per_sec: 12000,
++        n_block_align: 1,
++        bits_per_sample: 0,
++        data: None,
++    };
++    let pcm = pcm_format(2, 48000, 16);
++    let backend = MockBackend::new(vec![aac.clone(), pcm.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    // aac is index 0
++    negotiate_and_open(&mut server, vec![aac.clone(), pcm], aac, OpenReplyPdu::S_OK);
++    assert_eq!(server.client_version(), Some(Version::V1));
++
++    let out = server
++        .change_format(1)
++        .expect("change_format should not error, only skip");
++    assert!(
++        out.is_empty(),
++        "FormatChange must not be sent per 3.3.5.3.1's SHOULD NOT"
++    );
++    assert!(backend.state.lock().unwrap().format_changes.is_empty());
++}
++
++#[test]
++fn out_of_sequence_open_reply_before_open_is_ignored() {
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    server.start(1).unwrap();
++    let _ = process_encoded(&mut server, 1, RdpeaiPdu::Version(VersionPdu::new(Version::V1)));
++    let _ = process_encoded(&mut server, 1, RdpeaiPdu::Formats(FormatsPdu::client(vec![fmt])));
++
++    let out = process_encoded(&mut server, 1, RdpeaiPdu::OpenReply(OpenReplyPdu::ok()));
++    assert!(out.is_empty());
++    assert!(backend.state.lock().unwrap().open_replies.is_empty());
++}
++
++#[test]
++fn client_originated_open_pdu_is_ignored() {
++    // Open is server-to-client only; a client sending one is non-conformant and must not
++    // be treated as a valid transition (MS-RDPEAI 3.1.5: unrecognized/out-of-sequence
++    // packets MUST be ignored).
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend));
++
++    server.start(1).unwrap();
++    let out = process_encoded(
++        &mut server,
++        1,
++        RdpeaiPdu::Open(OpenPdu {
++            frames_per_packet: 320,
++            initial_format: 0,
++            capture_format: fmt,
++        }),
++    );
++    assert!(out.is_empty());
++}
++
++#[test]
++fn malformed_pdu_is_ignored_not_errored() {
++    // MS-RDPEAI 3.1.5: malformed or unrecognized PDUs MUST be ignored. A decode failure
++    // must not surface as an Err, since process() is reached through the shared DRDYNVC
++    // SVC processor and an Err there would fail the whole dynamic-channel message loop.
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt]);
++    let mut server = RdpeaiServer::new(Box::new(backend));
++
++    server.start(1).unwrap();
++    let out = server
++        .process(1, &[0xFF])
++        .expect("malformed PDU must be ignored, not errored");
++    assert!(out.is_empty());
++}
++
++#[test]
++fn close_resets_state_and_notifies_backend() {
++    let fmt = pcm_format(1, 16000, 16);
++    let backend = MockBackend::new(vec![fmt.clone()]);
++    let mut server = RdpeaiServer::new(Box::new(backend.clone()));
++
++    negotiate_and_open(&mut server, vec![fmt.clone()], fmt, OpenReplyPdu::S_OK);
++    assert!(server.current_format().is_some());
++
++    server.close(1);
++
++    assert!(backend.state.lock().unwrap().closed);
++    assert!(server.current_format().is_none());
++    assert!(server.negotiated_formats().is_empty());
++    // Opened state was reset to Start, so Open must be rejected again until re-negotiated.
++    assert!(server.open(320, 0, pcm_format(1, 16000, 16)).is_err());
++}

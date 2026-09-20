@@ -11,3 +11,6 @@ mod routing;
 
 pub use backend::HyprSoundFactory;
 pub use routing::AudioMode;
+
+pub mod microphone;
+pub mod microphone_rdp;

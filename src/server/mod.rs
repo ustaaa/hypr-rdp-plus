@@ -52,6 +52,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         egfx_codec,
         keyboard_layout_policy,
         audio_mode,
+        microphone,
         h264_backend,
         resolution_fixed,
         output,
@@ -130,6 +131,13 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         ))))
         .with_gfx_factory(Some(Box::new(gfx_factory)))
         .with_cliprdr_factory(Some(Box::new(cliprdr_factory)))
+        .with_rdpeai_factory(if microphone {
+            Some(Box::new(
+                crate::audio::microphone_rdp::MicrophoneFactory::default(),
+            ))
+        } else {
+            None
+        })
         .with_sound_factory(sound_factory)
         .build();
 
