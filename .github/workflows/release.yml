@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prepare pinned microphone dependency
+        run: ./scripts/prepare-ironrdp.sh
+
       - name: Install system dependencies
         run: |
           sudo apt-get update

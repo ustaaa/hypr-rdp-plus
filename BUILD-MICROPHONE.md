@@ -1,5 +1,12 @@
 # Build the microphone development version
 
+Clone this community fork (the upstream package does not include these changes):
+
+```bash
+git clone https://github.com/ustaaa/hypr-rdp.git hypr-rdp-microphone
+cd hypr-rdp-microphone
+```
+
 Keep this repository and its patched IronRDP dependency next to each other:
 
 ```text
