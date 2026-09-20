@@ -19,7 +19,14 @@ the complete upstream source checkout, including its license files; this patch
 does not replace or remove those notices. See the [upstream repository](https://github.com/Devolutions/IronRDP).
 
 Patch SHA-256:
-`eb4929bc863f94322009dbf954f5fab8db3ecaede9388ddfa3fab819cd6ecbbd`
+`27e56a892e56f49adb57130777e07cc19086b1e1a4d323257ba879fb646a0fd5`
 
 This is a development integration, not a claim that PR #1946 has been merged or
 that all RDP clients have passed microphone interoperability testing.
+
+The local performance change stages at most 100 events / 64 MiB of encoded
+wire data, reserves output ordering, and releases server state before the
+network flush. Oversized batches fail the connection instead of allocating
+without limit. Slow sends can still delay handlers that need to send a reply.
+Regression tests exercise input progress under a blocked socket, wire ordering,
+disconnect flushing, transport errors, and the staging limit.

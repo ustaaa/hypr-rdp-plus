@@ -7,7 +7,7 @@ parent_dir=$(dirname -- "$repo_dir")
 target_dir="$parent_dir/hypr-rdp-ironrdp"
 patch_file="$repo_dir/patches/ironrdp/0001-audio-input-server.patch"
 base=5198cde0f73485f3fbd999ea7c49293c86b80387
-patch_sha=eb4929bc863f94322009dbf954f5fab8db3ecaede9388ddfa3fab819cd6ecbbd
+patch_sha=27e56a892e56f49adb57130777e07cc19086b1e1a4d323257ba879fb646a0fd5
 
 # Never modify an existing checkout, including one created by an earlier run.
 if [[ -e "$target_dir" || -L "$target_dir" ]]; then
