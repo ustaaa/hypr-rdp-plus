@@ -426,6 +426,9 @@ pub(super) fn capture_loop_ext(
         }
     }
 
+    if proc.initial_resize_sent {
+        return Err(super::InitialResizeSent.into());
+    }
     Ok(())
 }
 

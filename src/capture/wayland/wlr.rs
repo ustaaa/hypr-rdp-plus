@@ -429,6 +429,9 @@ pub(super) fn capture_loop_wlr(
     }
 
     state.active_wlr_frame_id = None;
+    if proc.initial_resize_sent {
+        return Err(super::InitialResizeSent.into());
+    }
     Ok(())
 }
 

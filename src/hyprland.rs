@@ -260,6 +260,15 @@ pub fn set_monitor_geometry(
     transform: u64,
 ) -> Result<()> {
     anyhow::ensure!(!name.contains([',', '\n', '\r']), "invalid output name");
+    // Use a distinct standard-mode selector so Lua monitor-rule merging does
+    // not retain the native output's custom DRM modeline (Hyprland 0.56).
+    let dynamic_selector = std::env::var("HYPR_RDP_DYNAMIC_SELECTOR").ok();
+    let native_size = std::env::var("HYPR_RDP_NATIVE_SIZE").ok();
+    let size = format!("{width}x{height}");
+    let name = match (&dynamic_selector, &native_size) {
+        (Some(selector), Some(native)) if native != &size => selector.as_str(),
+        _ => name,
+    };
     let mode = format!("{width}x{height}@{refresh:.5}");
     let position = format!("{x}x{y}");
     match send_action(&format!("keyword monitor {name},{mode},{position},{scale},transform,{transform}")) {

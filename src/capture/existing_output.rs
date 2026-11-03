@@ -13,6 +13,7 @@ pub(super) struct Mode {
     y: i64,
     scale: f64,
     transform: u64,
+    available_modes: Vec<(u32, u32, f64)>,
 }
 impl Mode {
     fn from_monitors(monitors: &Value, name: &str) -> Result<Self> {
@@ -31,6 +32,13 @@ impl Mode {
             y: m["y"].as_i64().context("missing y")?,
             scale: m["scale"].as_f64().context("missing scale")?,
             transform: m["transform"].as_u64().context("missing transform")?,
+            available_modes: m["availableModes"].as_array().into_iter().flatten()
+                .filter_map(|value| {
+                    let text = value.as_str()?.trim_end_matches("Hz");
+                    let (size, hz) = text.split_once('@')?;
+                    let (w, h) = size.split_once('x')?;
+                    Some((w.parse().ok()?, h.parse().ok()?, hz.parse().ok()?))
+                }).collect(),
         };
         anyhow::ensure!(
             mode.width > 0
@@ -63,6 +71,19 @@ impl Mode {
         let mut requested = self.clone();
         requested.width = width;
         requested.height = height;
+        // Keep lower-resolution clients at native 100% UI scale. The saved
+        // original geometry is unchanged and restored when the session ends.
+        if width.min(height) <= 1200 {
+            requested.scale = 1.0;
+        }
+        // The physical panel's native refresh may not exist at the viewer's
+        // dimensions. Pick an advertised mode near 60 Hz, preserving the
+        // original mode for exact restoration.
+        if let Some((_, _, hz)) = self.available_modes.iter()
+            .filter(|(w, h, _)| *w == width && *h == height)
+            .min_by(|a, b| (a.2 - 60.0).abs().total_cmp(&(b.2 - 60.0).abs())) {
+            requested.refresh = *hz;
+        }
         Ok(requested)
     }
     fn matches(&self, other: &Self) -> bool {
@@ -258,5 +279,34 @@ mod tests {
         rotated.transform = 1;
         assert!(rotated.requested(1920, 1080).is_err());
         assert_eq!(rotated.transform, 1);
+    }
+}
+
+    #[test]
+    fn viewer_mode_uses_advertised_refresh_and_restores_custom_native() {
+        let original = Mode::from_monitors(&serde_json::json!([{
+            "name":"HDMI-A-1", "width":5120, "height":2160,
+            "refreshRate":49.963,"x":0,"y":0,"scale":1.6,"transform":0,
+            "availableModes":["1920x1200@59.88Hz", "3840x2160@60.00Hz"]
+        }]), "HDMI-A-1").unwrap();
+        assert_eq!(original.requested(1920,1200).unwrap().refresh,59.88);
+        assert_eq!(original.requested(3840,2160).unwrap().refresh,60.0);
+        assert_eq!(original.refresh,49.963);
+    }
+
+#[cfg(test)]
+mod client_scale_policy_tests {
+    use super::Mode;
+    #[test]
+    fn short_edge_1200_and_below_uses_one_and_preserves_native() {
+        let native = Mode::from_monitors(&serde_json::json!([{
+            "name":"HDMI-A-1","width":5120,"height":2160,
+            "refreshRate":49.963,"x":0,"y":0,"scale":1.6,"transform":0
+        }]),"HDMI-A-1").unwrap();
+        for (w,h) in [(1920,1200),(1920,1080),(1020,1200),(1200,1920)] {
+            assert_eq!(native.requested(w,h).unwrap().scale,1.0);
+        }
+        assert_eq!(native.requested(2560,1440).unwrap().scale,1.6);
+        assert_eq!(native.scale,1.6);
     }
 }

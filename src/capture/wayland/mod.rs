@@ -28,6 +28,15 @@ use state::AppState;
 
 const CAPTURE_SESSION_RESTART_LIMIT: u32 = 5;
 
+#[derive(Debug)]
+pub(super) struct InitialResizeSent;
+impl std::fmt::Display for InitialResizeSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "initial resize handed off for display reactivation")
+    }
+}
+impl std::error::Error for InitialResizeSent {}
+
 /// A session that ran healthily this long since its last restart has paid
 /// off its restart debt. External geometry changes are legitimate and
 /// unbounded over a long session; the budget only guards against restart
@@ -188,6 +197,10 @@ pub async fn start_capture(
                 pending_initial_resize,
                 stop_flag,
             ) {
+                if e.is::<InitialResizeSent>() {
+                    tracing::debug!("Capture handed off for initial resize reactivation");
+                    return;
+                }
                 tracing::error!("Capture thread error: {:#}", e);
             }
             // An exit nobody requested must surface as a disconnect: the

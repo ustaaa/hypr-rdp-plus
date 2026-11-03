@@ -51,6 +51,7 @@ pub(super) struct FrameProcessor {
     damage_detector: FrameDiffDamageDetector,
     pub(super) stats: FrameStats,
     pending_initial_resize: Option<DesktopSize>,
+    pub(super) initial_resize_sent: bool,
 }
 
 pub(super) struct FrameStats {
@@ -469,6 +470,7 @@ impl FrameProcessor {
             damage_detector: FrameDiffDamageDetector::new(),
             stats: FrameStats::new(),
             pending_initial_resize: None,
+            initial_resize_sent: false,
         }
     }
 
@@ -652,6 +654,8 @@ impl FrameProcessor {
                 self.pending_initial_resize = None;
                 if tx.blocking_send(DisplayUpdate::Resize(size)).is_err() {
                     tracing::info!("Display update channel closed");
+                } else {
+                    self.initial_resize_sent = true;
                 }
                 return false;
             }
@@ -1630,6 +1634,7 @@ mod tests {
         processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
 
         assert!(!processor.process(&frame, &display_tx));
+        assert!(processor.initial_resize_sent);
         assert!(!processor.sent_first_frame);
         assert!(processor.has_pending_damage());
         drain_gfx_pdus(&mut event_rx).assert_empty();
