@@ -31,6 +31,7 @@ UNIT = "omarchy-remote-desktop.service"
 MARKER = "# Managed by kokd.remote-desktop\n"
 MAX_IO = 65536
 ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_ON = ("microphone", "headless_fallback", "lock_on_disconnect")
 FLAGS = ("--password-file", "--output", "--cert", "--key", "--config",
          "--on-session-start", "--on-session-end", "--audio-mode", "--egfx-codec", "--microphone", "--fps", "--max-frames-in-flight", "--resize-output")
 
@@ -192,18 +193,27 @@ def validate(values):
     port = values.get("port", 3389)
     if type(port) is not int or not 1024 <= port <= 65535:
         raise Problem("Port must be a number between 1024 and 65535.")
-    for key in ("autostart", "audio", "microphone", "resize_output"):
-        if type(values.get(key, key == "microphone")) is not bool:
+    for key in ("autostart", "audio", "microphone", "resize_output", "headless_fallback", "lock_on_disconnect"):
+        if type(values.get(key, key in DEFAULT_ON)) is not bool:
             raise Problem(f"Invalid {key} setting.")
     for key, default, lower, upper in (("fps", 60, 15, 60), ("max_frames_in_flight", 2, 1, 3)):
         value = values.get(key, default)
         if type(value) is not int or not lower <= value <= upper:
             raise Problem(f"{key} must be a whole number between {lower} and {upper}.")
+    capture_mode = values.get("capture_mode", "ext")
+    if capture_mode not in ("wlr", "ext"):
+        raise Problem("capture_mode must be wlr or ext.")
+    scale = values.get("headless_scale", 1.6)
+    if type(scale) not in (int, float) or not 1 <= scale <= 3:
+        raise Problem("headless_scale must be a number between 1 and 3.")
     return dict(address=str(ip), port=port, username=username, output=output,
                 autostart=values.get("autostart", False), audio=values.get("audio", False),
                 resize_output=values.get("resize_output", False),
                 microphone=values.get("microphone", True), fps=values.get("fps", 60),
-                max_frames_in_flight=values.get("max_frames_in_flight", 2))
+                max_frames_in_flight=values.get("max_frames_in_flight", 2),
+                headless_fallback=values.get("headless_fallback", True),
+                lock_on_disconnect=values.get("lock_on_disconnect", True),
+                headless_scale=float(scale), capture_mode=capture_mode)
 
 
 def validate_password(password):
@@ -221,7 +231,7 @@ def inventory():
         outputs = [dict(name=m["name"], label=str(m.get("description") or m["name"])[:160])
                    for m in monitors[:32] if isinstance(m, dict)
                    and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", str(m.get("name", "")))
-                   and not str(m["name"]).startswith(("HEADLESS-", "hypr-rdp-"))]
+                   and str(m["name"]) != "hypr-rdp" and not str(m["name"]).startswith(("HEADLESS-", "hypr-rdp-"))]
         addresses = []
         for interface in interfaces[:64]:
             for item in interface.get("addr_info", [])[:16]:
@@ -407,11 +417,20 @@ WantedBy=graphical-session.target
         return {"message": "Settings saved. Remote access is off."}
 
     @staticmethod
-    def match_inventory(conf, live):
-        if conf["output"] not in [o["name"] for o in live["outputs"]]:
+    def match_inventory(conf, live, headless=None):
+        """Return True when the backend should create its own headless output.
+
+        headless=None decides from the live monitors; True/False keeps a decision
+        made at startup, so a running server never silently changes output.
+        """
+        present = conf["output"] in [o["name"] for o in live["outputs"]]
+        if headless is None:
+            headless = not present and conf.get("headless_fallback", True)
+        if not headless and not present:
             raise Problem("The selected monitor is unavailable. Reconnect it or choose another.")
         if conf["address"] not in [a["address"] for a in live["addresses"]]:
             raise Problem("The selected network is unavailable. Reconnect or choose another address.")
+        return headless
 
     def preflight(self, conf):
         if not self.plugin_enabled():
@@ -523,17 +542,20 @@ WantedBy=graphical-session.target
                 directory.rmdir()
         return {"message": "Setup removed. Remote access is off."}
 
-    def backend_args(self, conf, generation):
+    def backend_args(self, conf, generation, headless=False):
         conf = validate(conf)
+        # Without --output, hypr-rdp creates a headless output sized for the client.
+        output = ["--scale", f'{conf["headless_scale"]:g}'] if headless else ["--output", conf["output"],
+                                      "--resize-output=" + str(conf["resize_output"]).lower()]
         write_file(self.data / "backend.toml", "# Deliberately empty; all options below are controlled by the helper.\n")
         callback = [sys.executable, str(self.root / "bin/remote-desktopctl"), "event"]
         return [str(Path.home() / ".local/bin/hypr-rdp-microphone"), "--config", str(self.data / "backend.toml"),
                 "--bind", f'{conf["address"]}:{conf["port"]}', "--username", conf["username"],
                 "--password-file", str(self.data / "password"), "--cert", str(self.data / "cert.pem"),
-                "--key", str(self.data / "key.pem"), "--output", conf["output"], "--fps", str(conf["fps"]),
+                "--key", str(self.data / "key.pem"), *output, "--capture-mode", conf["capture_mode"],
+                "--fps", str(conf["fps"]),
                 "--max-frames-in-flight", str(conf["max_frames_in_flight"]),
                 "--microphone=" + str(conf["microphone"]).lower(),
-                "--resize-output=" + str(conf["resize_output"]).lower(),
                 "--egfx-codec", "avc420", "--audio-mode", "mirror" if conf["audio"] else "off",
                 "--on-session-start", shlex.join(callback + ["start", generation]),
                 "--on-session-end", shlex.join(callback + ["end", generation])]
@@ -545,8 +567,22 @@ WantedBy=graphical-session.target
         self.prepare_runtime()
         state = read_json(self.runtime / "generation.json", missing=True)
         if state and secrets.compare_digest(str(state.get("id", "")), generation):
+            previous = read_json(self.runtime / "event.json", missing=True)
+            was_connected = bool(previous and previous.get("generation") == generation and previous.get("connected"))
             save_json(self.runtime / "event.json", dict(generation=generation, connected=action == "start"))
+            # Lock only after a real client leaves; a service stop clears the
+            # generation first, so restarts and logout never reach this.
+            if action == "end" and was_connected:
+                conf = self.read_config(required=False)
+                if conf and conf.get("lock_on_disconnect", True):
+                    self.lock_session()
         return {}
+
+    @staticmethod
+    def lock_session():
+        with contextlib.suppress(OSError):
+            subprocess.Popen(["omarchy-system-lock"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
 
     def supervise(self):
         self.prepare_runtime()
@@ -564,8 +600,9 @@ WantedBy=graphical-session.target
             if not conf["enabled"]:
                 raise Problem("Remote access is disabled.")
             self.preflight(conf)
+            headless = self.match_inventory(conf, inventory())
             save_json(self.runtime / "generation.json", {"id": generation})
-            child = subprocess.Popen(self.backend_args(conf, generation), stdin=subprocess.DEVNULL,
+            child = subprocess.Popen(self.backend_args(conf, generation, headless), stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             started = time.monotonic()
             while not stopped:
@@ -586,7 +623,7 @@ WantedBy=graphical-session.target
                 if not current["enabled"]:
                     break
                 self.credential()
-                self.match_inventory(conf, inventory())
+                self.match_inventory(conf, inventory(), headless)
                 event = read_json(self.runtime / "event.json", missing=True)
                 connected = bool(event and event.get("generation") == generation and event.get("connected"))
                 # Inspect the child's socket ownership, not another server's port.

@@ -174,11 +174,35 @@ class HelperTests(unittest.TestCase):
         self.assertNotIn("password", text)
 
     def test_inventory_disappearance_never_falls_back(self):
-        self.app.match_inventory(GOOD, LIVE)
+        # A running server keeps its startup decision: a monitor or network that
+        # disappears stops it instead of silently switching output or address.
+        self.assertFalse(self.app.match_inventory(GOOD, LIVE))
         for missing in (dict(outputs=[], addresses=LIVE["addresses"]),
                         dict(outputs=LIVE["outputs"], addresses=[])):
             with self.assertRaises(rd.Problem):
-                self.app.match_inventory(GOOD, missing)
+                self.app.match_inventory(GOOD, missing, headless=False)
+        with self.assertRaises(rd.Problem):
+            self.app.match_inventory(GOOD, dict(outputs=LIVE["outputs"], addresses=[]))
+
+    def test_missing_monitor_at_start_uses_headless_output_unless_disabled(self):
+        no_monitor = dict(outputs=[], addresses=LIVE["addresses"])
+        self.assertTrue(self.app.match_inventory(GOOD, no_monitor))
+        self.assertTrue(self.app.match_inventory(GOOD, no_monitor, headless=True))
+        with self.assertRaises(rd.Problem):
+            self.app.match_inventory({**GOOD, "headless_fallback": False}, no_monitor)
+
+    def test_lock_only_after_a_real_client_leaves(self):
+        self.configured()
+        rd.save_json(self.app.runtime / "generation.json", {"id": "gen1"})
+        with patch.object(rd.App, "lock_session") as lock:
+            self.app.event("end", "gen1")          # no client was connected
+            lock.assert_not_called()
+            self.app.event("start", "gen1")
+            self.app.event("end", "gen1")
+            lock.assert_called_once()
+            self.app.event("start", "other")       # stale generation is ignored
+            self.app.event("end", "other")
+            lock.assert_called_once()
 
     def test_disable_revokes_before_systemctl_failure(self):
         self.configured()

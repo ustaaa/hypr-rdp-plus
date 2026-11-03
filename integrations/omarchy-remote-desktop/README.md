@@ -26,6 +26,17 @@ other viewers; the previous monitor settings are restored on disconnect. The
 plugin persists `resize_output` and passes an explicit `--resize-output=true` or
 `--resize-output=false` to a supporting custom backend.
 
+### Headless use, lock and capture (hypr-rdp-plus)
+
+These settings live in `~/.config/omarchy-remote-desktop/settings.json`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `headless_fallback` | `true` | If the selected monitor is missing when sharing starts, run without `--output` so the backend creates its own headless output sized for the client. A running server keeps its startup decision. |
+| `headless_scale` | `1.6` | Scale (1–3) of that headless output. |
+| `lock_on_disconnect` | `true` | Lock the desktop with `omarchy-system-lock` when a connected client leaves. Restarts and logout do not lock. |
+| `capture_mode` | `ext` | `ext` uses ext-image-copy-capture with zero-copy DMA-BUF into the VA-API encoder (falls back to shared-memory copies inside the backend). `wlr` is the older wlr-screencopy path. |
+
 Enable microphone redirection in the RDP client as well, then select
 **Hypr-RDP Remote Microphone** in the Omarchy application. Exported `.rdp` files
 include `audiocapturemode` matching the microphone toggle. **Share audio** is
