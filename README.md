@@ -1,4 +1,12 @@
-# hypr-rdp
+# hypr-rdp-plus
+
+**hypr-rdp-plus** is a community fork of [MuNeNICK/hypr-rdp](https://github.com/MuNeNICK/hypr-rdp)
+that adds remote microphone input, an Omarchy settings integration, headless use and
+hardware-first video. Hardware acceleration is always tried first: VA-API H.264 encoding
+and, with `--capture-mode ext`, zero-copy DMA-BUF capture straight into the encoder.
+The binary and wrapper keep their existing names (`hypr-rdp`, `hypr-rdp-microphone`)
+so current installs keep working.
+
 
 Optional: [resize the existing desktop to the RDP client](RESIZE-OUTPUT.md).
 

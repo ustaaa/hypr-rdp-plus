@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.0] - 2026-11-03 — hypr-rdp-plus
+
+First release under the name hypr-rdp-plus.
+
+### Added
+
+- Remote microphone redirection and the Omarchy Remote Desktop integration (`integrations/omarchy-remote-desktop`).
+- Resizing the existing desktop to the RDP client resolution, restored on disconnect.
+- Omarchy plugin: headless fallback when the selected monitor is missing (`headless_fallback`, `headless_scale`), locking the desktop when a client leaves (`lock_on_disconnect`) and a `capture_mode` setting.
+
+### Changed
+
+- The Omarchy plugin defaults to `ext` capture, which uses zero-copy DMA-BUF into the VA-API encoder. At 4K this cut backend CPU from about 13% to 4% in testing.
+- Hardware acceleration is the documented first path; see AGENTS.md.
+
+### Fixed
+
+- The initial resize handoff is no longer treated as a capture failure, which disconnected Windows App during display reactivation.
+
 ## [0.1.6] - 2026-09-10
 
 ### Added

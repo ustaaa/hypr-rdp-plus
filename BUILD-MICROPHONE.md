@@ -3,7 +3,7 @@
 Clone this community fork (the upstream package does not include these changes):
 
 ```bash
-git clone https://github.com/ustaaa/hypr-rdp.git hypr-rdp-microphone
+git clone https://github.com/ustaaa/hypr-rdp-plus.git hypr-rdp-microphone
 cd hypr-rdp-microphone
 ```
 
